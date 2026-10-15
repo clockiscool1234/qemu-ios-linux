@@ -64,6 +64,8 @@
 #include "hw/arm/ipod-agent.h"
 #include "qemu/guest-random.h"
 #include "hw/misc/ios_vibrator.h"
+#include "ui/console.h"
+#include "ui/input.h"
 
 /* Addresses and interrupts: N18AP 8C148 DT (arm-io maps child offsets at 0x80000000). */
 #define S5L8920_DRAM_BASE       0x40000000
@@ -291,6 +293,7 @@ struct S5L8920MachineState {
     char *die_id;                        /* ChipID words 2-3 of the unit, hex pair */
     char *usb_tcp_addr;                  /* usbmuxd-qemu host bridge; empty = the built-in host */
     bool btn_hold, btn_home;             /* button-hold/-home properties */
+    int  kbd_btn_held[Q_KEY_CODE__MAX];  /* qcode -> 1 + button pin, for release tracking */
     bool ring_silent;                    /* ring-switch: the side switch at silent (default off: ring) */
     QEMUBH *bt_kick;                     /* resumes the CDMA receive from the HCI's UART */
     bool gles_debug;                     /* paint what the GL bridge refuses magenta (tests) */
@@ -693,6 +696,52 @@ static void s5l8920_bt_rxdma(void *opaque, int n, int level)
         qemu_bh_schedule(s->bt_kick);
     }
 }
+static void s5l8920_set_button(S5L8920MachineState *s, int pin, bool down); /* defined below */
+/*
+ * Host keyboard -> hardware button chords.
+ *
+ * Mappings:
+ *   P  -> power (hold)
+ *   H  -> home (menu)
+ *   -  -> vol down
+ *   =  -> vol up
+ */
+static void s5l8920_kbd_event(DeviceState *dev, QemuConsole *src,
+                              InputEvent *evt)
+{
+    S5L8920MachineState *s = S5L8920_MACHINE(qdev_get_machine());
+    int q = qemu_input_key_value_to_qcode(evt->u.key.data->key);
+    bool down = evt->u.key.data->down;
+    int pin = -1;
+
+    if (q < 0 || q >= Q_KEY_CODE__MAX) {
+        return;
+    }
+    /* Release: always deliver if this key was holding a button. */
+    if (!down && s->kbd_btn_held[q]) {
+        pin = s->kbd_btn_held[q] - 1;
+    } else if (down) {
+        const S5L8920Buttons *b = &s->board->buttons;
+        switch (q) {
+        case Q_KEY_CODE_P:     pin = b->hold;    break;  /* power */
+        case Q_KEY_CODE_H:     pin = b->menu;    break;  /* home  */
+        case Q_KEY_CODE_MINUS: pin = b->voldown; break;
+        case Q_KEY_CODE_EQUAL: pin = b->volup;   break;
+        default: break;
+        }
+    }
+    if (pin < 0) {
+        return;
+    }
+    s->kbd_btn_held[q] = down ? pin + 1 : 0;
+    s5l8920_set_button(s, pin, down);
+}
+
+static const QemuInputHandler s5l8920_kbd_handler = {
+    .name  = "S5L8920 Buttons",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = s5l8920_kbd_event,
+};
 
 static void s5l8920_init(MachineState *machine)
 {
@@ -1133,6 +1182,9 @@ static void s5l8920_init(MachineState *machine)
     s->ap_off_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, s5l8920_ap_cut, s);
     qemu_register_powerdown_notifier(&s5l8920_powerdown_notifier);
     qemu_register_reset(s5l8920_cpu_reset, s);
+
+    /* Route host keyboard to the hardware button chords (Cmd/Alt+L, etc.). */
+    qemu_input_handler_register(s->gpio, &s5l8920_kbd_handler);
 }
 
 static char *s5l8920_get_kboot(Object *obj, Error **errp)

@@ -389,7 +389,6 @@ struct IPad1MachineState {
     DeviceState *pmgr;                   /* its timebase runs on across a hibernate */
     QEMUTimer *ap_off_timer;             /* the PMU's hibernate cut, a moment after the command */
     bool gles_debug;                     /* paint what the GL bridge refuses magenta (tests) */
-    bool kbd_cmd, kbd_shift;
     bool btn_hold, btn_home;             /* button-hold/-home properties */
     int kbd_btn_held[Q_KEY_CODE__MAX];   /* qcode -> 1 + button pin */
     int mtt_x[MT_MAX_FINGERS], mtt_y[MT_MAX_FINGERS];  /* latched per slot */
@@ -1067,9 +1066,8 @@ static Notifier ipad1_powerdown_notifier = { .notify = ipad1_powerdown_req };
 
 /*
  * Buttons are GPIO port 0 pins 0-4, active low, idle high in the GPIO model.
- * Same host chords as the iPod machine: Cmd+L hold/power, Cmd+Shift+H
- * home/menu, Cmd+- volume down, Cmd+= volume up. A key that pressed a
- * button always releases it, even if Cmd went up first.
+ * Key mappings: P -> power/hold, H -> home/menu, - -> vol down, = -> vol up.
+ * A key that pressed a button always releases it.
  */
 static void ipad1_kbd_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
 {
@@ -1078,29 +1076,17 @@ static void ipad1_kbd_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
     bool down = evt->u.key.data->down;
     int pin = -1;
 
-    switch (q) {
-    case Q_KEY_CODE_META_L:
-    case Q_KEY_CODE_META_R:
-        s->kbd_cmd = down;
-        return;
-    case Q_KEY_CODE_SHIFT:
-    case Q_KEY_CODE_SHIFT_R:
-        s->kbd_shift = down;
-        return;
-    default:
-        break;
-    }
     if (q < 0 || q >= Q_KEY_CODE__MAX) {
         return;
     }
     if (!down && s->kbd_btn_held[q]) {
         pin = s->kbd_btn_held[q] - 1;
-    } else if (down && s->kbd_cmd) {
+    } else if (down) {
         switch (q) {
-        case Q_KEY_CODE_L:     pin = S5L8930_GPIO_BTN_HOLD; break;
-        case Q_KEY_CODE_H:     if (s->kbd_shift) pin = S5L8930_GPIO_BTN_MENU; break;
+        case Q_KEY_CODE_P:     pin = S5L8930_GPIO_BTN_HOLD;    break;
+        case Q_KEY_CODE_H:     pin = S5L8930_GPIO_BTN_MENU;    break;
         case Q_KEY_CODE_MINUS: pin = S5L8930_GPIO_BTN_VOLDOWN; break;
-        case Q_KEY_CODE_EQUAL: pin = S5L8930_GPIO_BTN_VOLUP; break;
+        case Q_KEY_CODE_EQUAL: pin = S5L8930_GPIO_BTN_VOLUP;   break;
         default: break;
         }
     }

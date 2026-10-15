@@ -195,8 +195,6 @@ typedef struct IPodTouch1GMachineState {
     bool usb_wrangler_quirk;
     bool usb_wrangler_quirk_done;
 
-    bool kbd_cmd, kbd_shift;
-
     char *usb_tcp_addr;              /* host bridge (usbmuxd-qemu) host:port, empty = no link */
     QEMUTimer *pwroff_timer;         /* system_powerdown: the hold-and-slide gesture */
     int pwroff_phase, pwroff_step;

@@ -738,7 +738,7 @@ static void fmss_try_map_packed(IPodTouchFMSSState *s)
         fprintf(stderr, "[fmss] packed NAND %s is truncated (index wants %zu of "
                 "%zu bytes); ignoring it\n", s->nand_path, index_bytes,
                 (size_t)st.st_size - 24);
-        munmap(p, st.st_size);
+        munmap((void *)p, st.st_size);
         return;
     }
 

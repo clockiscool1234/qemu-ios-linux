@@ -1,0 +1,860 @@
+5e3b3407a2 The iPod touch 2G now wakes from deep sleep the way the hardware does. Before, on 3.1.3 a device with no USB host connection hibernated about a minute after boot. The CPU then spun at c0061eb0 with interrupts masked, and Home or Hold never brought it back, so a session that lost its usbmuxd link stayed dead until a reboot.
+112b63702c macOS dylib 1.1: qemu_ios_ui_shutdown and qemu_ios_ui_hardware_keyboard
+4d39f3c52b regress on 7.x: after usbmux attaches, wait for it_boot's report before the checks' AFC
+e04e04fbc6 multitouch: calibrate the iPod (Zephyr2) frame for the 2G and 1G alike
+13d5c77d2f imgtools: ipad1_var.py, a booted device's /var read back off its NAND
+19fc680732 docs n90: 7.1.2 reboot loop was the rw root; 6.x and 7.x both stop at the GL dispatch layout
+d0694c3283 Merge s5l8920: N18 clean power-off + persistence (TV-out at SDO/mixer), usb-tcp-addr
+ee79173acb n18: clean power-off and persistence; TV-out; usb-tcp-addr
+eaaee06980 iPhone-2G: Home works and the ringer HUD is gone (volume pads really rest high)
+3f73803d64 iPhone-2G: system_powerdown holds Hold until 1.0's power-off sheet is up
+d03497e584 N81 touch: AppleMultitouchN1SPI bootloads and drives the digitizer
+5473401ce9 A4 machine: per-board descriptor table (A4Board), K48 its first entry
+8650a40e5b net/slirp: flip user netdev restrict in place (netdev_set_restrict)
+b0dc9f4fda D1815: a halt's restart with iBoot's power-off flag is the power-off (5.x, smoke #28, #39)
+e4fc089d40 ipad1: RGBOUT pipe frame interrupt (4.3.5 slider power-off), dart1 modelled
+0c3ed293ee one-shots: -no-reboot (iOS 5's halt restarts through the PMU with USB power attached)
+b376072fba iop-core: a system reset stops the IOP core and unmaps the old firmware (second boot after a reboot pings again)
+cf55257de2 D1815: register 0x7b = 0x0b is the PMU's restart (reboot resets the machine; 4.3.5's "workloop" panic was a stuck restart)
+d103567551 IOP_RING_TRACE: also at the AP's doorbell (so a reused control slot is seen sent), unbuffered on stderr
+ef05999002 iPod builder: every new device boots with aes-uid=engine
+5768f4e834 ipod: derive the early command-line literal from iBoot's restore string
+a70b657c6b it-boot: touch each window before the host fills it; count a good verdict for the package switched to
+7c36fa9cfd keybag one-shot: halt with RB_QUICK; stop at a panic and retry
+71b2cbfa18 Merge ipad1-fw4 573fd5639b into ipad1: iOS 4.2.1 restore-ramdisk keybag one-shot; lit Connect to iTunes, clean power-off, reboot
+c90722eaf2 ipad1: writable NOR (nor-rw) for the 4.x effaceable region; pick the restore-ramdisk route
+657b0f3c67 ipad1: iOS 4.2.1 (8C148) through the pipeline to launchd + both volumes
+79549f1a54 ipad1: display pipe stride as iBoot leaves it; Hold->slide powers off
+e417972d54 ipad1: Wi-Fi is the default network
+5854208320 ipad1: seal golden stores (one clean halt), boot to lock screen in 12 s
+252f1666fa tests/ipad1/regress.py: iPad regression gate (boot, usbmux, afc, persist, net)
+37dc6ed11b ipad1: copy-on-write NAND overlay for the IOP page store
+db7b34fdfe Check SpringBoard recovery without rebooting away install pressure
+3226597fa5 Check SpringBoard recovery without rebooting away install pressure
+a6055da354 bt: answer the minidriver launch announcement, and reset the HCI chardev with the machine
+549757c359 bt: answer the minidriver launch announcement, and reset the HCI chardev with the machine
+b09a862668 it-halt: shut the guest down through the kernel, not through SpringBoard
+1d16dc6da2 it-halt: shut the guest down through the kernel, not through SpringBoard
+feb556f471 Answer the guest's standby write, so 3.1.3 can finally power itself off
+484b9cadf9 Answer the guest's standby write, so 3.1.3 can finally power itself off
+dbf3ab60b9 usb-otg: drop the host link on core reset so usbmuxd can re-enumerate
+ca64e93d51 usb-otg: drop the host link on core reset so usbmuxd can re-enumerate
+7fecd300b9 usb_otg: redial the host bridge whenever the link is down
+f7acacfac5 usb_otg: redial the host bridge whenever the link is down
+1d36bf7909 Merge persist-check fix: the harness was failing on its own missing directory
+341e93ec3c Merge persist-check fix: the harness was failing on its own missing directory
+3302e79b90 Merge persist-check fix: the harness was failing on its own missing directory
+2fe5474b62 tests/ipod: the persist check was failing on its own missing directory
+aa97765075 tests/ipod: the persist check was failing on its own missing directory
+8b4a60f11b tests/ipod: the persist check was failing on its own missing directory
+cb14c049f3 audio: deliver DMAC0's completion interrupt, and get sound out
+dfb3023754 audio: deliver DMAC0's completion interrupt, and get sound out
+0a6d1b8cdc audio: deliver DMAC0's completion interrupt, and get sound out
+7117623d35 it-pasteboard: it_pbd, the guest daemon that actually sets the pasteboard
+174a7901dc it-pasteboard: it_pbd, the guest daemon that actually sets the pasteboard
+310c45b9a2 it-pasteboard: it_pbd, the guest daemon that actually sets the pasteboard
+bea3da15f1 multitouch: the no-fingers frame put its checksum 28 bytes too far along
+6f86429eeb multitouch: the no-fingers frame put its checksum 28 bytes too far along
+223cd4aed0 Merge QEMU v10.0.2 into ipod_touch_2g
+74cc568301 pl192: reset the VIC's registers and re-derive its output lines
+8b10d30aaa pl192: reset the VIC's registers and re-derive its output lines
+084d07b8a4 Reset handlers and save-state support across the device tree
+b1f95473c8 Reset handlers and save-state support across the device tree
+ba8527047c Realize ten devices that were only ever mapped, never parented
+11bc73bebb Realize ten devices that were only ever mapped, never parented
+7b008f717a pl080: deassert the IRQ lines on reset -- this fixes reboot
+408d0c026a pl080: deassert the IRQ lines on reset -- this fixes reboot
+97f2a32050 gpio: the volume buttons are active low, so rest their pads high
+72699b06c8 gpio: the volume buttons are active low, so rest their pads high
+37177e5b39 fmss: restore 2.1.1's boot-args poke - the branch had been reboot-looping
+b7a2dbca67 fmss: restore 2.1.1's boot-args poke - the branch had been reboot-looping
+4d18e87459 multitouch: reset the ATN ack to the download status so touch survives sleep
+f524e830fb multitouch: reset the ATN ack to the download status so touch survives sleep
+aabacc4c16 Merge tests/ipod: a regression harness that drives the UI and asserts on content
+6f9c8beb67 Merge tests/ipod: a regression harness that drives the UI and asserts on content
+2de526cf58 tests: an iPod touch 2G regression harness that drives the UI
+8f6dd36d6d tests: an iPod touch 2G regression harness that drives the UI
+07be884677 Power: shut the guest down cleanly, so its writes survive
+1d8a899383 Power: shut the guest down cleanly, so its writes survive
+804179dd8b NAND: flush the guest filesystem before stopping the emulator
+20275d8569 NAND: flush the guest filesystem before stopping the emulator
+147c78ac1e FMSS: a page programmed in this session must read back
+9a28fe72e6 FMSS: a page programmed in this session must read back
+a28edf5382 USB: do not retire a bulk IN transfer the host only partly read
+e7a47dfafa USB: do not retire a bulk IN transfer the host only partly read
+813d4845bb Display: reset the LCD and MIPI DSI so the panel comes back after a warm reboot
+e4634c249c Display: reset the LCD and MIPI DSI so the panel comes back after a warm reboot
+1c2e7f8b1e iPod Touch 2G: re-stage the bootrom on reset so the machine can actually reboot
+122f179cf6 iPod Touch 2G: re-stage the bootrom on reset so the machine can actually reboot
+d0e1f81000 Merge night-imgtools: fix MIPI DSI TxReadyHsClk — unwedges sleep and reboot
+ea982c7ba5 Merge night-imgtools: fix MIPI DSI TxReadyHsClk — unwedges sleep and reboot
+135a3535c0 MIPI DSI: make TxReadyHsClk follow the CLKCTRL clock request
+e81f55d883 MIPI DSI: make TxReadyHsClk follow the CLKCTRL clock request
+4a6f8818ba Note: the watchdog reset device is present but does NOT yet auto-reboot
+6eada7a30e Note: the watchdog reset device is present but does NOT yet auto-reboot
+3c7ccaa014 Merge night-imgtools: model the watchdog reset device so the guest can reboot itself after fsck
+fad446d7dd Merge night-imgtools: model the watchdog reset device so the guest can reboot itself after fsck
+fdd7c37926 iPod Touch 2G: model the watchdog reset so the guest can reboot itself
+823df8f0b0 iPod Touch 2G: model the watchdog reset so the guest can reboot itself
+3349c32edd Merge night-nand: NAND persistence works across reboots
+2043bd59d8 Merge night-nand: NAND persistence works across reboots
+86d67d4a19 FMSS: place persisted writes at the block the FTL intends, not the page it picked
+be93c2319a FMSS: place persisted writes at the block the FTL intends, not the page it picked
+69ea084708 FMSS: instrumentation for the reboot stall (opt-in erase model, read/write traces)
+cbec7e50b4 FMSS: instrumentation for the reboot stall (opt-in erase model, read/write traces)
+ecb411f402 FMSS: copy-on-write NAND overlay behind nandrw= (experimental, off by default)
+0c7a03484e FMSS: copy-on-write NAND overlay behind nandrw= (experimental, off by default)
+f492b46e6b PMU: model the D1759 as a nested interrupt controller (wake path)
+a956e1d5cb PMU: model the D1759 as a nested interrupt controller (wake path)
+33f5d67514 PMU: make registers stateful so sleep no longer reboots the device
+88c88b2b98 PMU: make registers stateful so sleep no longer reboots the device
+bd9258917f virtio-gpu: Destroy virgl resources on virtio-gpu reset
+4577ac30d8 Merge tag 'bsd-user-2026q1-upstream-pull-request' of ssh://github.com/bsdimp/qemu into staging
+c5ecd377a0 tests/docker: add support for podman remote access
+b6f070a771 bsd-user: Add miscellaneous BSD syscall implementations
+edfff4f7a3 bsd-user: Add bsd-misc.c to build
+75f6b9bcad bsd-user: Add do_bsd_quotactl, do_bsd_reboot and do_bsd_getdtablesize
+13395029b5 i386/sev: add migration blockers only once
+96dc397fe2 migration: Notify migration FAILED before starting VM
+4c7f05232c target/i386/kvm: reset AMD PMU registers during VM reset
+2451fca14a tests/functional/arm/aspeed_ast2600: Enhance OTP test with functional validation
+2f0870fd6a Merge tag 'pull-target-arm-20260210' of https://gitlab.com/pm215/qemu into staging
+ac4af772ad whpx: arm64: add partition-wide reset on the reboot path
+b6b867b9c1 hw/arm/smmuv3-accel: Install SMMUv3 GBPA based hwpt
+bba249a256 qga: use access(2) to check for command existance instead of questionable stat(2)
+c5b4afd4d5 qga: Support guest shutdown of BusyBox-based systems
+03cb7661d2 hw/ppc: Trigger Fadump boot if fadump is registered
+63e39ec114 amd_iommu: Unmap all address spaces under the AMD IOMMU on reset
+b10166b104 x86: ich9: fix default value of 'No Reboot' bit in GCS
+cb5ee0017f hw/loongarch/virt: Register reset interface with cpu plug callback
+19ae064832 tests/functional/test_aarch64_virt_gpu: Skip test if EGL won't initialize
+c642ddf19b hw/loongarch/virt: Add reset support for kernel irqchip
+f3028b7d2d vfio: Register/unregister container for CPR only once for each container
+80f9321308 ppc/pnv: Add a default formatted PNOR image
+094a3dbc55 migration: ram block cpr blockers
+7389992c84 Merge tag 'mem-next-pull-request' of https://gitlab.com/peterx/qemu into staging
+30943e496f system/physmem: poisoned memory discard on reboot
+2740747084 hw/char: Add emulation of Diva GSP PCI management boards
+f7ae9612fb test/functional: Update buildroot images to 2024.11
+5a7b6029c1 fw_cfg: Don't set callback_opaque NULL in fw_cfg_modify_bytes_read()
+713484d038 virtio-mem: unplug memory only during system resets, not device resets
+44bd87a500 tests/qtest/migration: Split CPR tests
+96746f7a95 ppc/pnv: Fix direct controls quiesce
+bc4d45b275 tests/functional: Add a functional test for the sx1 board
+aff835834b tests/functional: Add a functional test for the collie board
+63731c346f Merge tag 'pull-loongarch-20240912' of https://gitlab.com/gaosong/qemu into staging
+a840d70ee4 target/loongarch: Add compatible support about VM reboot
+a4975023fb hw/scsi/lsi53c895a: bump instruction limit in scripts processing to fix regression
+c6ea92aab8 Merge tag 'migration-20240317-pull-request' of https://gitlab.com/peterx/qemu into staging
+20e6b15653 migration: cpr-reboot documentation
+67f4f663cd libvhost-user: Dynamically remap rings after (temporarily?) removing memory regions
+6026fdbdbd spapr: nested: register nested-hv api hcalls only for cap-nested-hv
+67ff703c97 Merge tag 'pull-vfio-20240310' of https://github.com/legoater/qemu into staging
+0cb51c183a vfio: allow cpr-reboot migration if suspended
+87a2848715 migration: massage cpr-reboot documentation
+c0c6a0e352 Merge tag 'migration-next-pull-request' of https://gitlab.com/peterx/qemu into staging
+ce5db1cb49 migration: update cpr-reboot description
+8a6b3f4dc9 smmu: Clear SMMUPciBus pointer cache when system reset
+9a457383ce virtio_iommu: Clear IOMMUPciBus pointer cache when system reset
+fceffd6b3f tests/vm/freebsd: Reload the sshd configuration
+68c691ca99 s390x/pci: drive ISM reset from subsystem reset
+2abf0da22c roms/opensbi: Upgrade from v1.3.1 to v1.4
+2ebe6659ec Merge tag 'seabios-hppa-v13-pull-request' of https://github.com/hdeller/qemu-hppa into staging
+284cc1f44e Merge tag 'seabios-hppa-v13-pull-request' of https://github.com/hdeller/qemu-hppa into staging
+69c224816e target/hppa: Update SeaBIOS-hppa to version 13
+d2ed4d8a04 target/hppa: Update SeaBIOS-hppa to version 13
+4bf501dc01 target/riscv: pmp: Clear pmp/smepmp bits on reset
+44b6d82da7 target/riscv: pmp: Clear pmp/smepmp bits on reset
+0d9e8c0b67 Add Hyper-V Dynamic Memory Protocol driver (hv-balloon) base
+4b079c7479 Add Hyper-V Dynamic Memory Protocol driver (hv-balloon) base
+75b7b25d44 Merge tag 'migration-20231102-pull-request' of https://gitlab.com/juan.quintela/qemu into staging
+5e059d5bef Merge tag 'migration-20231102-pull-request' of https://gitlab.com/juan.quintela/qemu into staging
+e7b428d6bc tests/qtest: migration: add reboot mode test
+fbd41ec258 tests/qtest: migration: add reboot mode test
+a87e64519b cpr: reboot mode
+273ea858e7 cpr: reboot mode
+e77326179d migration/doc: We broke backwards compatibility
+82e36ef9df migration/doc: We broke backwards compatibility
+d7dc0682f5 vhost-user: call VHOST_USER_SET_VRING_ENABLE synchronously
+ba70f8bad7 vhost-user: call VHOST_USER_SET_VRING_ENABLE synchronously
+8633951530 target/riscv: Clear CSR values at reset and sync MPSTATE with host
+c3b920d96b target/riscv: Clear CSR values at reset and sync MPSTATE with host
+9a8af69967 Merge tag 'pull-request-2023-09-12' of https://gitlab.com/thuth/qemu into staging
+e6bf6d33e8 Merge tag 'pull-request-2023-09-12' of https://gitlab.com/thuth/qemu into staging
+ef1535901a s390x: do a subsystem reset before the unprotect on reboot
+757ff836f9 s390x: do a subsystem reset before the unprotect on reboot
+0d0be87659 virtio-gpu: replace the surface with null surface when resetting
+d7b58ecccb virtio-gpu: replace the surface with null surface when resetting
+79dbd910c9 Merge tag 'hppa-boot-reboot-fixes-pull-request' of https://github.com/hdeller/qemu-hppa into staging
+88cc515410 Merge tag 'hppa-boot-reboot-fixes-pull-request' of https://github.com/hdeller/qemu-hppa into staging
+34ec3aea54 target/hppa: Update to SeaBIOS-hppa version 8
+bc857c029d target/hppa: Update to SeaBIOS-hppa version 8
+50ba97e928 target/hppa: Fix OS reboot issues
+78494bc15a target/hppa: Fix OS reboot issues
+f837b468cd hw/intc/allwinner-a10-pic: Handle IRQ levels other than 0 or 1
+65c1919dbd hw/intc/allwinner-a10-pic: Handle IRQ levels other than 0 or 1
+88693ab2a5 s390x/pv: Fix spurious warning with asynchronous teardown
+b6d11a8d25 s390x/pv: Fix spurious warning with asynchronous teardown
+29c343a463 Merge tag 'pull-target-arm-20230420' of https://git.linaro.org/people/pmaydell/qemu-arm into staging
+3216903a3c Merge tag 'pull-target-arm-20230420' of https://git.linaro.org/people/pmaydell/qemu-arm into staging
+d784c5fbba tests/avocado: Add reboot tests to Cubieboard
+23e9542dc5 tests/avocado: Add reboot tests to Cubieboard
+fdc27ced04 Revert "x86: reinitialize RNG seed on system reboot"
+e02809ee2f Revert "x86: reinitialize RNG seed on system reboot"
+79b7067dc6 i386/xen: implement HYPERVISOR_sched_op, SCHEDOP_shutdown
+98918b91b5 i386/xen: implement HYPERVISOR_sched_op, SCHEDOP_shutdown
+3db629f03e Merge tag 'pull-request-2023-02-27' of https://gitlab.com/thuth/qemu into staging
+b4b254764b Merge tag 'pull-request-2023-02-27' of https://gitlab.com/thuth/qemu into staging
+c3a073c610 s390x/pv: Add support for asynchronous teardown for reboot
+913312c508 s390x/pv: Add support for asynchronous teardown for reboot
+4919d0c44a Merge tag 'pr-2023-02-16' of https://gitlab.com/a1xndr/qemu into staging
+a97c052459 Merge tag 'pr-2023-02-16' of https://gitlab.com/a1xndr/qemu into staging
+148fbf0d58 net: stream: add a new option to automatically reconnect
+ccf399a362 net: stream: add a new option to automatically reconnect
+b8b52178e2 fuzz/generic-fuzz: add a limit on DMA bytes written
+f1bb5c5ed4 fuzz/generic-fuzz: add a limit on DMA bytes written
+1375104370 fuzz/generic-fuzz: use reboots instead of forks to reset state
+9ff68d7716 fuzz/generic-fuzz: use reboots instead of forks to reset state
+8d1e76b35b fuzz: add fuzz_reset API
+5c5afec886 fuzz: add fuzz_reset API
+44055caaa5 tests/avocado: Test Aspeed Zephyr SDK v00.01.08 on AST1030 board
+5bcc06868b tests/avocado: Test Aspeed Zephyr SDK v00.01.08 on AST1030 board
+4f2c6448c3 hw/nvram/eeprom_at24c: Make reset behavior more like hardware
+63d280dc99 hw/nvram/eeprom_at24c: Make reset behavior more like hardware
+c0d19126f3 tests: acpi: add reboot cycle to bridge test
+0bb4b5f973 tests: acpi: add reboot cycle to bridge test
+2efe88a948 tests: boot_sector_test(): make it multi-shot
+9f457f8973 tests: boot_sector_test(): make it multi-shot
+debbda1c67 x86: pcihp: fix invalid AML PCNT calls to hotplugged bridges
+87dfa02830 x86: pcihp: fix invalid AML PCNT calls to hotplugged bridges
+a6b6414f0c hw/isa: enable TCO watchdog reboot pin strap by default
+7c6bd70e8b hw/isa: enable TCO watchdog reboot pin strap by default
+03451953c7 s390x/pci: reset ISM passthrough devices on shutdown and system reset
+86604b4ff7 s390x/pci: reset ISM passthrough devices on shutdown and system reset
+4fd75ce076 acpi: x86: move RPQx field back to _SB scope
+539ca7d9a3 acpi: x86: move RPQx field back to _SB scope
+9306d7c057 Merge tag 'qga-pull-2022-10-26' of https://github.com/kostyanf14/qemu into staging
+6d3e075eff Merge tag 'qga-pull-2022-10-26' of https://github.com/kostyanf14/qemu into staging
+d0d8d5707d Merge tag 'pull-target-arm-20221027' of https://git.linaro.org/people/pmaydell/qemu-arm into staging
+7c31002007 Merge tag 'pull-target-arm-20221027' of https://git.linaro.org/people/pmaydell/qemu-arm into staging
+6233a13859 mips/malta: pass RNG seed via env var and re-randomize on reboot
+59df475318 mips/malta: pass RNG seed via env var and re-randomize on reboot
+a76b911c0d rx: re-randomize rng-seed on reboot
+b1b29b7bd6 rx: re-randomize rng-seed on reboot
+2db07d0506 openrisc: re-randomize rng-seed on reboot
+e322b821b3 openrisc: re-randomize rng-seed on reboot
+4fbae24450 mips/boston: re-randomize rng-seed on reboot
+46cbca140c mips/boston: re-randomize rng-seed on reboot
+64c75db3c5 riscv: re-randomize rng-seed on reboot
+767690659b riscv: re-randomize rng-seed on reboot
+98aa4c839d arm: re-randomize rng-seed on reboot
+74c8510cd6 arm: re-randomize rng-seed on reboot
+e1e618b9a0 device-tree: add re-randomization helper function
+9a0e5a951f device-tree: add re-randomization helper function
+e40762fcd6 qga: Add shutdown/halt/reboot support for FreeBSD
+435adbb2fc qga: Add shutdown/halt/reboot support for FreeBSD
+ce58c8ee4d Merge tag 'm68k-for-7.2-pull-request' of https://github.com/vivier/qemu-m68k into staging
+d41d169da6 Merge tag 'm68k-for-7.2-pull-request' of https://github.com/vivier/qemu-m68k into staging
+281ac13ece m68k: write bootinfo as rom section and re-randomize on reboot
+206e52c330 m68k: write bootinfo as rom section and re-randomize on reboot
+ec19444a53 hyperv: fix SynIC SINT assertion failure on guest reset
+14a4d04b7e hyperv: fix SynIC SINT assertion failure on guest reset
+604a86895f ui/gtk-egl: egl context needs to be unbound in the end of gd_egl_switch
+cc638e5ea6 ui/gtk-egl: egl context needs to be unbound in the end of gd_egl_switch
+f8ec554cb8 Merge tag 'for-upstream' of https://gitlab.com/bonzini/qemu into staging
+927f092e23 Merge tag 'for-upstream' of https://gitlab.com/bonzini/qemu into staging
+cc63374a5a x86: re-initialize RNG seed when selecting kernel
+a7c4072cf8 x86: re-initialize RNG seed when selecting kernel
+763a2828bf x86: reinitialize RNG seed on system reboot
+6510a6e210 x86: reinitialize RNG seed on system reboot
+f0ccce6a95 tpm_crb: Avoid backend startup just before shutdown under Xen
+b936adfe8c tpm_crb: Avoid backend startup just before shutdown under Xen
+ae29379998 hw/riscv: virt: fix syscon subnode paths
+eac826ae69 hw/riscv: virt: fix syscon subnode paths
+b5fcfe927b hw/openrisc: Add the OpenRISC virtual machine
+4548c36821 hw/openrisc: Add the OpenRISC virtual machine
+0c9717ff35 target/ppc: Implement new wait variants
+76211d8144 target/ppc: Implement new wait variants
+f471e8b060 hw/usb/hcd-ehci: fix writeback order
+cfb1e4c662 hw/usb/hcd-ehci: fix writeback order
+3ebe676a34 hw/cxl/device: Implement get/set Label Storage Area (LSA)
+e5c24a53e1 hw/cxl/device: Implement get/set Label Storage Area (LSA)
+c8ec041d00 qga/commands-posix: 'guest-shutdown' for Solaris
+0aeea733c0 qga/commands-posix: 'guest-shutdown' for Solaris
+5286c36622 target/i386: properly reset TSC on reset
+cfcccd75c6 target/i386: properly reset TSC on reset
+43530095e1 hw/arm/smmuv3: Fix device reset
+f05a11c368 hw/arm/smmuv3: Fix device reset
+47fa1ad534 Merge remote-tracking branch 'remotes/vivier/tags/m68k-for-7.0-pull-request' into staging
+4776e70c7e Merge remote-tracking branch 'remotes/vivier/tags/m68k-for-7.0-pull-request' into staging
+1b9fc6d8ba Merge tag 'for-upstream' of https://gitlab.com/bonzini/qemu into staging
+52f46a33ec Merge tag 'for-upstream' of https://gitlab.com/bonzini/qemu into staging
+2c3132279b sgx: Reset the vEPC regions during VM reboot
+36ac88897e sgx: Reset the vEPC regions during VM reboot
+45a904af38 aspeed/smc: Add watchdog Control/Status Registers
+51cfd458a7 aspeed/smc: Add watchdog Control/Status Registers
+73c8bf4ccf Merge remote-tracking branch 'remotes/pmaydell/tags/pull-target-arm-20210702' into staging
+6d4144aabe Merge remote-tracking branch 'remotes/pmaydell/tags/pull-target-arm-20210702' into staging
+e3bcf57c1a hw/gpio/gpio_pwr: use shutdown function for reboot
+d9858d2043 hw/gpio/gpio_pwr: use shutdown function for reboot
+38f2cfbbc3 hw/arm: Add basic power management to raspi.
+857ef1c31c hw/arm: Add basic power management to raspi.
+29f9c63689 target/avr: Ignore unimplemented WDR opcode
+e26fab835e target/avr: Ignore unimplemented WDR opcode
+6cd04a88fa hw/avr/atmega.c: use the avr51 cpu for atmega1280
+84d8da86f2 hw/avr/atmega.c: use the avr51 cpu for atmega1280
+a7f523c7d1 vhost-user: Introduce nested event loop in vhost_user_read()
+f5d93a8fae vhost-user: Introduce nested event loop in vhost_user_read()
+d1c2e3ce3d spapr_drc.c: add hotunplug timeout for CPUs
+c0062ccfea spapr_drc.c: add hotunplug timeout for CPUs
+51254ffb32 spapr_drc.c: introduce unplug_timeout_timer
+526ec77c46 spapr_drc.c: introduce unplug_timeout_timer
+92a5199b29 sev/i386: Don't allow a system reset under an SEV-ES guest
+19edcc32a7 sev/i386: Don't allow a system reset under an SEV-ES guest
+040bdafce1 spapr: Adjust firmware path of PCI devices
+18c219e7db spapr: Adjust firmware path of PCI devices
+4d1ccc17f4 vhost: Check for valid vdev in vhost_backend_handle_iotlb_msg
+7060ef5d4f vhost: Check for valid vdev in vhost_backend_handle_iotlb_msg
+c97377652d hw: gpio: implement gpio-pwr driver for qemu reset/poweroff
+1c7f96b4ad hw: gpio: implement gpio-pwr driver for qemu reset/poweroff
+c27025e044 runstate: cleanup reboot and panic actions
+ee1a509c85 runstate: cleanup reboot and panic actions
+73598c75df spapr: Improve handling of memory unplug with old guests
+994be7266a spapr: Improve handling of memory unplug with old guests
+7b5fa0b583 ui: add support for remote power control to VNC server
+dc348d88f2 ui: add support for remote power control to VNC server
+930ef3b5c2 spapr: Fix reset of transient DR connectors
+ab911b26a6 spapr: Fix reset of transient DR connectors
+1e8b5b1aa1 spapr: Allow memory unplug to always succeed
+2cdc84a3aa spapr: Allow memory unplug to always succeed
+c753e8e725 vl: Add option to avoid stopping VM upon guest panic
+8fac8f97bb vl: Add option to avoid stopping VM upon guest panic
+2a5ad60b54 vl: Add an -action option specifying response to guest events
+2c807b66f1 vl: Add an -action option specifying response to guest events
+e6dba04813 qmp: generalize watchdog-set-action to -no-reboot/-no-shutdown
+25759aadd2 qmp: generalize watchdog-set-action to -no-reboot/-no-shutdown
+9fc0ab5c9c qga: Tweak a guest-shutdown error message
+9a8394d5a8 qga: Tweak a guest-shutdown error message
+fb764373ea Merge remote-tracking branch 'remotes/huth-gitlab/tags/pull-request-2020-11-23' into staging
+493d62e15d Merge remote-tracking branch 'remotes/huth-gitlab/tags/pull-request-2020-11-23' into staging
+7a3d37a3f2 pc-bios/s390: Update the s390-ccw bios binaries
+8129bbe9e4 pc-bios/s390: Update the s390-ccw bios binaries
+3d6519968b pc-bios: s390x: Clear out leftover S390EP string
+d16341c58f pc-bios: s390x: Clear out leftover S390EP string
+5663ac2aa0 Merge remote-tracking branch 'remotes/kraxel/tags/vga-20200929-pull-request' into staging
+690a2bf4fd Merge remote-tracking branch 'remotes/kraxel/tags/vga-20200929-pull-request' into staging
+3745d59ee4 virtio-gpu-3d: fix abnormal display after a warm reboot
+9a3b984e8f virtio-gpu-3d: fix abnormal display after a warm reboot
+f00f57f344 Merge remote-tracking branch 'remotes/alistair/tags/pull-riscv-to-apply-20200910' into staging
+e714ff8dcc Merge remote-tracking branch 'remotes/alistair/tags/pull-riscv-to-apply-20200910' into staging
+ab3d207fe8 riscv: sifive_test: Allow 16-bit writes to memory region
+b3ad59f60d riscv: sifive_test: Allow 16-bit writes to memory region
+64dbe2c8b8 spapr_vscsi: do not allow device hotplug
+f2686c23df spapr_vscsi: do not allow device hotplug
+14c179541b aspeed/sdmc: Perform memory training
+f0ab1310c3 aspeed/sdmc: Perform memory training
+8ebde78620 roms/opensbi: Upgrade from v0.7 to v0.8
+d3b927488d roms/opensbi: Upgrade from v0.7 to v0.8
+c55bcb1f47 spapr: Clarify error and documentation for broken KVM XICS
+57c901480e spapr: Clarify error and documentation for broken KVM XICS
+9303ecb658 Merge remote-tracking branch 'remotes/cohuck/tags/s390x-20200727' into staging
+ef47af62de Merge remote-tracking branch 'remotes/cohuck/tags/s390x-20200727' into staging
+aef92d87c5 pseries: fix kvmppc_set_fwnmi()
+bbee6f2074 pseries: fix kvmppc_set_fwnmi()
+d1bb69db4c s390x/protvirt: allow to IPL secure guests with -no-reboot
+1e6f5efae7 s390x/protvirt: allow to IPL secure guests with -no-reboot
+f5ec79f5e0 fuzz: Expect the cmdline in a freeable GString
+61b15028c2 fuzz: Expect the cmdline in a freeable GString
+673205379f Merge remote-tracking branch 'remotes/philmd-gitlab/tags/python-next-20200714' into staging
+c6f213010b Merge remote-tracking branch 'remotes/philmd-gitlab/tags/python-next-20200714' into staging
+fdb87f0dc2 tests/acceptance: Don't test reboot on cubieboard
+a3ad3460f8 tests/acceptance: Don't test reboot on cubieboard
+a0690c3900 tests/acceptance: wait() instead of shutdown() where appropriate
+df20644a90 tests/acceptance: wait() instead of shutdown() where appropriate
+2c1fb4d5c0 hw/arm/virt-acpi-build: Only expose flash on older machine types
+21ceb3e9d8 hw/arm/virt-acpi-build: Only expose flash on older machine types
+910b25766b virtio-mem: Paravirtualized memory hot(un)plug
+a6d454e5f9 virtio-mem: Paravirtualized memory hot(un)plug
+d24f31db3b exec: Introduce ram_block_discard_(disable|require)()
+5bb8669b80 exec: Introduce ram_block_discard_(disable|require)()
+74aaddc628 kvm: i386: allow TSC to differ by NTP correction bounds without TSC scaling
+73a6c329e9 kvm: i386: allow TSC to differ by NTP correction bounds without TSC scaling
+5133ed1790 hw/riscv: sifive_u: Add reset functionality
+8487b7b910 hw/riscv: sifive_u: Add reset functionality
+81e0efb2e5 audio/jack: honour the enable state of the audio device
+c068122477 audio/jack: honour the enable state of the audio device
+b489f015fb Merge remote-tracking branch 'remotes/stefanha/tags/block-pull-request' into staging
+fd76f015a7 Merge remote-tracking branch 'remotes/stefanha/tags/block-pull-request' into staging
+6851803a46 fuzz: fix typo in i440fx-qtest-reboot arguments
+2d6058adfc fuzz: fix typo in i440fx-qtest-reboot arguments
+0911a60c76 ppc/spapr: Add hotremovable flag on DIMM LMBs on drmem_v2
+0779684072 ppc/spapr: Add hotremovable flag on DIMM LMBs on drmem_v2
+b894c6ed4a Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-5.1-20200507' into staging
+6f74d746d6 Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-5.1-20200507' into staging
+087820e37f spapr: Drop CAS reboot flag
+7e3db8415d spapr: Drop CAS reboot flag
+86962462f8 spapr: Don't check capabilities removed between CAS calls
+0ad52986d9 spapr: Don't check capabilities removed between CAS calls
+6cf9413229 nvme: introduce PMR support from NVMe 1.4 spec
+7e901eae3c nvme: introduce PMR support from NVMe 1.4 spec
+ce4adc0b6e exec: Fix for qemu_ram_resize() callback
+abb666eedd exec: Fix for qemu_ram_resize() callback
+e7ebf057e6 hw/scsi/vmw_pvscsi: Remove assertion for kick after reset
+1f8b35990d hw/scsi/vmw_pvscsi: Remove assertion for kick after reset
+a092a95547 configure: disable MTTCG for MIPS guests
+569a3d934f configure: disable MTTCG for MIPS guests
+bfd05e8127 roms: opensbi: Upgrade from v0.5 to v0.6
+84f59d8195 roms: opensbi: Upgrade from v0.5 to v0.6
+ad334d89a6 spapr: Handle pending hot plug/unplug requests at CAS
+e84534847a spapr: Handle pending hot plug/unplug requests at CAS
+f962cac4c2 cpus: avoid pause_all_vcpus getting stuck due to race
+05ecdd6f0e cpus: avoid pause_all_vcpus getting stuck due to race
+5073b5d3ea exec/rom_reset: Free rom data during inmigrate skip
+d784045af9 exec/rom_reset: Free rom data during inmigrate skip
+bd83c861c0 modules: load modules from versioned /var/run dir
+49dedd289d modules: load modules from versioned /var/run dir
+de2749bcb2 tests/boot_linux_console: Add a SD card test for the OrangePi PC board
+e1cca96be2 tests/boot_linux_console: Add a SD card test for the OrangePi PC board
+c40b1ded0a tests/boot_linux_console: Add initrd test for the Orange Pi PC board
+b7e1375358 tests/boot_linux_console: Add initrd test for the Orange Pi PC board
+9bfc04f9ef pc-bios: s390x: Save iplb location in lowcore
+76578f8088 pc-bios: s390x: Save iplb location in lowcore
+04f713242d fuzz: add i440fx fuzz targets
+8a8105aaa0 fuzz: add i440fx fuzz targets
+ab8584349c spapr: Fix handling of unplugged devices during CAS and migration
+cf4e4075e1 spapr: Fix handling of unplugged devices during CAS and migration
+4b63db1289 spapr: Don't use spapr_drc_needed() in CAS code
+aef2f98cb7 spapr: Don't use spapr_drc_needed() in CAS code
+971b2a1e5b Merge remote-tracking branch 'remotes/palmer/tags/riscv-for-master-5.0-sf2' into staging
+99e12c74e7 Merge remote-tracking branch 'remotes/palmer/tags/riscv-for-master-5.0-sf2' into staging
+0e404da007 riscv/virt: Add syscon reboot and poweroff DT nodes
+e9b358977e riscv/virt: Add syscon reboot and poweroff DT nodes
+7dc58deea7 pvpanic: implement crashloaded event handling
+e2a9b344d6 pvpanic: implement crashloaded event handling
+600d7b47e8 pvpanic: introduce crashloaded for pvpanic
+24a8b366cf pvpanic: introduce crashloaded for pvpanic
+771b01eb76 virtiofsd: Clean up inodes on destroy
+84391bbe27 virtiofsd: Clean up inodes on destroy
+e8556f4909 virtiofsd: Handle hard reboot
+5254d1fb16 virtiofsd: Handle hard reboot
+7cea426c1d Merge remote-tracking branch 'remotes/mst/tags/for_upstream' into staging
+fe825119c3 Merge remote-tracking branch 'remotes/mst/tags/for_upstream' into staging
+e33ee3097f tests/boot_linux_console: Add a SD card test for the CubieBoard
+9750123d52 tests/boot_linux_console: Add a SD card test for the CubieBoard
+0b73197881 ppc/spapr: Don't call KVM_SVM_OFF ioctl on TCG
+39223c31b0 ppc/spapr: Don't call KVM_SVM_OFF ioctl on TCG
+905db91697 ppc/spapr: Support reboot of secure pseries guest
+3c8763ea39 ppc/spapr: Support reboot of secure pseries guest
+e24e58e8ac q800: implement mac rom reset function for BIOS-less mode
+0442b294e2 q800: implement mac rom reset function for BIOS-less mode
+8e5943260a Merge remote-tracking branch 'remotes/vivier2/tags/trivial-branch-pull-request' into staging
+072cfb755e Merge remote-tracking branch 'remotes/vivier2/tags/trivial-branch-pull-request' into staging
+8937a39da2 Revert "qemu-options.hx: Update for reboot-timeout parameter"
+d9ec953a08 Revert "qemu-options.hx: Update for reboot-timeout parameter"
+30d2a17b46 hw/i386: Remove the deprecated machines 0.12 up to 0.15
+bc64bdca9d hw/i386: Remove the deprecated machines 0.12 up to 0.15
+9b3a31c745 kvm: Reallocate dirty_bmap when we change a slot
+77694b0c9c kvm: Reallocate dirty_bmap when we change a slot
+8deb8019d6 spapr: Don't trigger a CAS reboot for XICS/XIVE mode changeover
+957989fca3 spapr: Don't trigger a CAS reboot for XICS/XIVE mode changeover
+117378bf03 net/virtio: return early when failover primary alread added
+b04a48b70f net/virtio: return early when failover primary alread added
+6911fde410 riscv/virt: Increase flash size
+d15b2455bd riscv/virt: Increase flash size
+412fbef3d0 Merge remote-tracking branch 'remotes/philmd-gitlab/tags/fw_cfg-next-pull-request' into staging
+7b399a9759 Merge remote-tracking branch 'remotes/philmd-gitlab/tags/fw_cfg-next-pull-request' into staging
+eda4e62cc2 tests/fw_cfg: Test 'reboot-timeout=-1' special value
+762f63af1d tests/fw_cfg: Test 'reboot-timeout=-1' special value
+20a1922032 fw_cfg: Allow reboot-timeout=-1 again
+9d2fe7a611 fw_cfg: Allow reboot-timeout=-1 again
+efdb45bfd7 tests/boot_linux_console: Run BusyBox on 5KEc 64-bit cpu
+6ebaa00843 tests/boot_linux_console: Run BusyBox on 5KEc 64-bit cpu
+017aa60b25 tests/boot_linux_console: Add initrd test for the Exynos4210
+2ae3f6dc8e tests/boot_linux_console: Add initrd test for the Exynos4210
+1a9559e8f8 tests/acceptance: Test OpenBIOS on the PReP/40p
+92ac92d49e tests/acceptance: Test OpenBIOS on the PReP/40p
+bad76ac319 Merge remote-tracking branch 'remotes/vivier2/tags/trivial-branch-pull-request' into staging
+50e49a3909 Merge remote-tracking branch 'remotes/vivier2/tags/trivial-branch-pull-request' into staging
+bbd9e6985f qemu-options.hx: Update for reboot-timeout parameter
+3086521f8b qemu-options.hx: Update for reboot-timeout parameter
+1bd71dce4b runstate: ignore exit request in finish migrate state
+6c95203989 runstate: ignore exit request in finish migrate state
+0f0b43868a Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-4.2-20191004' into staging
+a39ad8b174 Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-4.2-20191004' into staging
+28cf553afe intel_iommu: Sanity check vfio-pci config on machine init done
+88472bfa9a intel_iommu: Sanity check vfio-pci config on machine init done
+3b3f0646a4 Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-4.2-20190829' into staging
+8e9c2db03f Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-4.2-20190829' into staging
+9146206eb2 spapr: Use SHUTDOWN_CAUSE_SUBSYSTEM_RESET for CAS reboots
+4451b0deb2 spapr: Use SHUTDOWN_CAUSE_SUBSYSTEM_RESET for CAS reboots
+3bf5de5240 qmp: don't emit the RESET event on wakeup
+d64077d35e qmp: don't emit the RESET event on wakeup
+a2230bd778 VirtIO-RNG: Update default entropy source to `/dev/urandom`
+a7ebdc9f29 VirtIO-RNG: Update default entropy source to `/dev/urandom`
+7abc0c6d35 xics/spapr: Detect old KVM XICS on POWER9 hosts
+d0bd9fa46f xics/spapr: Detect old KVM XICS on POWER9 hosts
+6b364d2abf roms/edk2: update submodule from edk2-stable201903 to edk2-stable201905
+7147500a61 roms/edk2: update submodule from edk2-stable201903 to edk2-stable201905
+8936867349 BootLinuxConsoleTest: Run kerneltests BusyBox on Malta
+cd3640355f BootLinuxConsoleTest: Run kerneltests BusyBox on Malta
+70de096748 target/ppc: Set PSSCR_EC on cpu halt to prevent spurious wakeup
+5c6e4151a4 target/ppc: Set PSSCR_EC on cpu halt to prevent spurious wakeup
+a9e0cb67b7 hw/display/ramfb: lock guest resolution after it's set
+9261121f05 hw/display/ramfb: lock guest resolution after it's set
+8dc7fd56dd Merge remote-tracking branch 'remotes/philmd-gitlab/tags/fw_cfg-20190523-pull-request' into staging
+fae226da16 Merge remote-tracking branch 'remotes/philmd-gitlab/tags/fw_cfg-20190523-pull-request' into staging
+b41e912f32 tests: fw_cfg: add 'reboot-timeout' test case
+db832e5c24 tests: fw_cfg: add 'reboot-timeout' test case
+04da973501 hw/nvram/fw_cfg: Store 'reboot-timeout' as little endian
+7ba45f06a6 hw/nvram/fw_cfg: Store 'reboot-timeout' as little endian
+b9a4c15164 roms/edk2: advance to tag edk2-stable201903
+a10b33ffa0 roms/edk2: advance to tag edk2-stable201903
+558e8c6139 i386/kvm: ignore masked irqs when update msi routes
+68d1368074 i386/kvm: ignore masked irqs when update msi routes
+2a078b1080 intel_iommu: fix operator in vtd_switch_address_space
+be826a6b8a intel_iommu: fix operator in vtd_switch_address_space
+2313a88fe6 s390x/pci: Unplug remaining requested devices on pcihost reset
+73b594ae25 s390x/pci: Unplug remaining requested devices on pcihost reset
+9f2a46b111 s390x/pci: Drop release timer and replace it with a flag
+1eb4825c08 s390x/pci: Drop release timer and replace it with a flag
+ac6dd31e3f acpi: build TPM Physical Presence interface
+d7f9a7c687 acpi: build TPM Physical Presence interface
+3b97c01e9c tpm: allocate/map buffer for TPM Physical Presence interface
+86bffc1c80 tpm: allocate/map buffer for TPM Physical Presence interface
+e59dbbac03 Merge remote-tracking branch 'remotes/philmd/tags/fw_cfg-20190104-pull-request' into staging
+08ce7d2255 Merge remote-tracking branch 'remotes/philmd/tags/fw_cfg-20190104-pull-request' into staging
+ee5d0f89de fw_cfg: Fix -boot reboot-timeout error checking
+f99208301d fw_cfg: Fix -boot reboot-timeout error checking
+46ea94ca9c qmp: query-current-machine with wakeup-suspend-support
+c554021180 qmp: query-current-machine with wakeup-suspend-support
+9254893882 qmp: Split ShutdownCause host-qmp into quit and system-reset
+c2f4818658 qmp: Split ShutdownCause host-qmp into quit and system-reset
+0b8f74488e update seabios to master snapshot
+0b6b9ceff1 update seabios to master snapshot
+2cc9ddcceb intel_iommu: better handling of dmar state switch
+cac5da28fb intel_iommu: better handling of dmar state switch
+d5a515738e Merge remote-tracking branch 'remotes/kraxel/tags/vga-20180903-pull-request' into staging
+7eb4834224 Merge remote-tracking branch 'remotes/kraxel/tags/vga-20180903-pull-request' into staging
+161f4c4717 Revert "virtio-gpu: fix crashes upon warm reboot with vga mode"
+5bd7fba57e Revert "virtio-gpu: fix crashes upon warm reboot with vga mode"
+93f874fe9d virtio-gpu: fix crashes upon warm reboot with vga mode
+31af013572 virtio-gpu: fix crashes upon warm reboot with vga mode
+ccc2cef8b3 spapr: Correct inverted test in spapr_pc_dimm_node()
+965d6cf344 spapr: Correct inverted test in spapr_pc_dimm_node()
+7320bb2cb0 Merge remote-tracking branch 'remotes/cohuck/tags/s390x-20180702' into staging
+73c2ed255d Merge remote-tracking branch 'remotes/cohuck/tags/s390x-20180702' into staging
+76ed4b18de s390/ipl: fix ipl with -no-reboot
+b897594868 s390/ipl: fix ipl with -no-reboot
+a30fb811cb s390x: refactor reset/reipl handling
+bc4db0777d s390x: refactor reset/reipl handling
+838fb84f83 s390x/ccw: make sure all ccw devices are properly reset
+b08153f625 s390x/ccw: make sure all ccw devices are properly reset
+8983e3e350 ui: introduce vfio_display_reset
+7583655a18 ui: introduce vfio_display_reset
+9cdd2a736b update seabios to 1.11.1
+4e447b22fa update seabios to 1.11.1
+fe823b6f87 io/channel-command: Do not kill the child process after closing the pipe
+275995fd9b io/channel-command: Do not kill the child process after closing the pipe
+067e68e704 i.MX: Add code to emulate i.MX2 watchdog IP block
+d80a9076a1 i.MX: Add code to emulate i.MX2 watchdog IP block
+a40227911c ivshmem: Disable irqfd on device reset
+2a19f947a9 ivshmem: Disable irqfd on device reset
+ae6b06ab65 hw: convert virtio-input-hid device to keycodemapdb
+3304fdc0c1 hw: convert virtio-input-hid device to keycodemapdb
+339ef8fb6a hw/xtensa/xtfpga: rewrite mini bootloader
+b5932e84f5 hw/xtensa/xtfpga: rewrite mini bootloader
+96a6298889 Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-2.12-20171215' into staging
+99e29e6b0f Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-2.12-20171215' into staging
+d6322252b3 spapr/rtas: fix reboot of a a SMP TCG guest
+534793b685 spapr/rtas: fix reboot of a a SMP TCG guest
+339686a358 pc-bios/s390-ccw: zero out bss section
+f2e951d448 pc-bios/s390-ccw: zero out bss section
+3da87f7713 Merge remote-tracking branch 'remotes/cohuck/tags/s390x-20171120-v1' into staging
+b3aad7b39b Merge remote-tracking branch 'remotes/cohuck/tags/s390x-20171120-v1' into staging
+6cbf1ec85c pc-bios/s390-ccw.img: update image
+3bed8fc8d7 pc-bios/s390-ccw.img: update image
+8775d91a0f pc-bios/s390-ccw: Fix problem with invalid virtio-scsi LUN when rebooting
+83c0d75bdb pc-bios/s390-ccw: Fix problem with invalid virtio-scsi LUN when rebooting
+3a575cd2c2 hw/intc/arm_gicv3_its: Fix the VM termination in vm_change_state_handler()
+721bae7871 hw/intc/arm_gicv3_its: Fix the VM termination in vm_change_state_handler()
+083fab0290 seabios: update to 1.11 prerelease
+ff982c619c seabios: update to 1.11 prerelease
+827b17c468 spapr: sanity check size of the CAS buffer
+278f5de089 spapr: sanity check size of the CAS buffer
+30bf9ed168 spapr: fix CAS-generated reset
+68932e5f8b spapr: fix CAS-generated reset
+79d16c21a5 virtio-gpu: don't clear QemuUIInfo information on reset
+e7d4780459 virtio-gpu: don't clear QemuUIInfo information on reset
+10f12e6450 hw/ppc: CAS reset on early device hotplug
+b45c762df0 hw/ppc: CAS reset on early device hotplug
+5625817423 hw/ppc: clear pending_events on machine reset
+cefe62e81f hw/ppc: clear pending_events on machine reset
+2772cf6be9 pseries: Use smaller default hash page tables when guest can resize
+9898bb590f pseries: Use smaller default hash page tables when guest can resize
+66d5c492dd pseries: Reset CPU compatibility mode
+5c845d0f7e pseries: Reset CPU compatibility mode
+2f295167e0 q35/mch: implement extended TSEG sizes
+9427b6cfed q35/mch: implement extended TSEG sizes
+a14f9b8292 hw/misc/exynos4210_pmu: Add support for system poweroff
+7997a1ea2e hw/misc/exynos4210_pmu: Add support for system poweroff
+3936161f1f pci: deassert intx when pci device unrealize
+97be106e73 pci: deassert intx when pci device unrealize
+a1a636b8b4 ppc/pnv: restrict BMC object to the BMC simulator
+fc15bdd4ec ppc/pnv: restrict BMC object to the BMC simulator
+bce0b69159 ppc/pnv: generate an OEM SEL event on shutdown
+4764fd2f14 ppc/pnv: generate an OEM SEL event on shutdown
+cd60d85ef6 ipmi: introduce an ipmi_bmc_gen_event() API
+946996f20a ipmi: introduce an ipmi_bmc_gen_event() API
+6d54af0ea9 9pfs: clear migration blocker at session reset
+7f4203f1e3 9pfs: clear migration blocker at session reset
+fc3a1fd74f x86: Work around SMI migration breakages
+726edbd06b x86: Work around SMI migration breakages
+34f1b23f8a elf-loader: Allow late loading of elf
+3d6f316293 elf-loader: Allow late loading of elf
+013befe1ca aspeed: add a watchdog controller
+d841d57ee6 aspeed: add a watchdog controller
+0b17d809b0 Merge remote-tracking branch 'remotes/borntraeger/tags/s390x-20170201' into staging
+ff322604e7 Merge remote-tracking branch 'remotes/borntraeger/tags/s390x-20170201' into staging
+1a0e4c8b02 s390x/kvm: fix small race reboot vs. cmma
+c7ddc3c88b s390x/kvm: fix small race reboot vs. cmma
+62ef3760d4 spapr: migration support for CAS-negotiated option vectors
+efa1792a87 spapr: migration support for CAS-negotiated option vectors
+66a77ea676 Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-2.8-20161028' into staging
+0854fe7192 Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-2.8-20161028' into staging
+6e99f5741f seabios: update to 1.10.0 release.
+3f3c96fea3 seabios: update to 1.10.0 release.
+9c1f8f4493 migration: sync all address spaces
+6141b2a13e migration: sync all address spaces
+fa3007e7ec OpenBIOS: switch over to official OpenBIOS git repo
+bd04c2c6b4 OpenBIOS: switch over to official OpenBIOS git repo
+c80276b420 input: add trace events for full queues
+b67e858b60 input: add trace events for full queues
+bb0995468a s390x/ipl: fix reboots for migration from different bios
+f5bb469625 s390x/ipl: fix reboots for migration from different bios
+a2e71b28e8 ppc: Fix rfi/rfid/hrfi/... emulation
+29d9038fd6 ppc: Fix rfi/rfid/hrfi/... emulation
+4a4b344c7c xics,xics_kvm: Handle CPU unplug correctly
+34ad09b088 xics,xics_kvm: Handle CPU unplug correctly
+3bef0451e6 linux-user: Fix qemu-binfmt-conf.sh to store config across reboot
+5a905a1d2e linux-user: Fix qemu-binfmt-conf.sh to store config across reboot
+f40eb921da spapr_drc: enable immediate detach for unsignalled devices
+36498da8bd spapr_drc: enable immediate detach for unsignalled devices
+75fd6f13af virtio-pci: call pci reset variant when guest requests reset.
+8ede36ef18 virtio-pci: call pci reset variant when guest requests reset.
+fee5b753ff seabios: update to 1.9.1 stable release
+aa1b26025f seabios: update to 1.9.1 stable release
+b527db44ad ARM: PL061: Clear PL061 device state after reset
+08a62fc6e6 ARM: PL061: Clear PL061 device state after reset
+1bfa316ce7 virtio-net: use the backend cross-endian capabilities
+2c1d5279a5 virtio-net: use the backend cross-endian capabilities
+ad30c0b0d8 seabios: update submodule to release 1.9.0
+6bdcc1f251 seabios: update submodule to release 1.9.0
+10b8ec73e6 arm: boot: Add board specific setup code API
+8db960972e arm: boot: Add board specific setup code API
+b556854bd8 spapr: Don't allow memory hotplug to memory less nodes
+301a5fbbee spapr: Don't allow memory hotplug to memory less nodes
+e33d22fab3 piix: Document coreboot-specific RAM size config register
+80210c99a7 piix: Document coreboot-specific RAM size config register
+be66680e83 hw/acpi/ich9: clear smi_en on reset
+41720aa5ee hw/acpi/ich9: clear smi_en on reset
+05e514b1d4 AioContext: optimize clearing the EventNotifier
+fa280a3b5c AioContext: optimize clearing the EventNotifier
+5add35bec1 ich9: implement strap SPKR pin logic
+62d22f711e ich9: implement strap SPKR pin logic
+7ce0f7dc87 Merge remote-tracking branch 'remotes/agraf/tags/signed-ppc-for-upstream' into staging
+eeceef9512 Merge remote-tracking branch 'remotes/agraf/tags/signed-ppc-for-upstream' into staging
+aef87d1b87 sPAPR: Reenable EEH functionality on reboot
+497cc8a0bd sPAPR: Reenable EEH functionality on reboot
+bd8f1ebce4 net/dp8393x: fix hardware reset
+27fad8cdb1 net/dp8393x: fix hardware reset
+77ae0b2a6e s390-virtio: clear {used,avail}_event_idx on reset as well
+24a86691de s390-virtio: clear {used,avail}_event_idx on reset as well
+5655f931ab vfio-pci: Reset workaround for AMD Bonaire and Hawaii GPUs
+1ccb1a4bf7 vfio-pci: Reset workaround for AMD Bonaire and Hawaii GPUs
+294ce717e0 vhost-user: Send VHOST_RESET_OWNER on vhost stop
+af9e6ab6f1 vhost-user: Send VHOST_RESET_OWNER on vhost stop
+4e289b1b62 ehci: fix segfault when hot-unplugging ehci controller
+e648d9c0b9 ehci: fix segfault when hot-unplugging ehci controller
+88dd1b8d00 ohci: fix resource cleanup leak
+8cccc0efcc ohci: fix resource cleanup leak
+537e572a7f uhci: fix segfault when hot-unplugging uhci controller
+5581d719a7 uhci: fix segfault when hot-unplugging uhci controller
+165fa4091e Merge remote-tracking branch 'remotes/borntraeger/tags/s390x-20150310' into staging
+a814d785b4 Merge remote-tracking branch 'remotes/borntraeger/tags/s390x-20150310' into staging
+2d5eeef1c0 s390-ccw: rebuild BIOS
+f96f8f4093 s390-ccw: rebuild BIOS
+5c8d542004 s390-ccw.img: Reinitialize guessing on reboot
+ff36008e57 s390-ccw.img: Reinitialize guessing on reboot
+d70414a578 acpi: update RSDP on guest access
+17a42ad5f2 acpi: update RSDP on guest access
+11d39a1310 Merge remote-tracking branch 'remotes/borntraeger/tags/s390x-20150218' into staging
+49e3eeb2bc Merge remote-tracking branch 'remotes/borntraeger/tags/s390x-20150218' into staging
+2e13fbe42d s390x/ipl: make s390x ipl device aware of migration
+1c09e6c980 s390x/ipl: make s390x ipl device aware of migration
+e91e972ccf s390x/ipl: drop reipl parameters on resets
+efee07a707 s390x/ipl: drop reipl parameters on resets
+60786ef339 memory: API to allocate resizeable RAM MR
+8d9a3ae88d memory: API to allocate resizeable RAM MR
+62be4e3a50 exec: qemu_ram_alloc_resizeable, qemu_ram_resize
+6023ade32e exec: qemu_ram_alloc_resizeable, qemu_ram_resize
+e6b8fd246c spapr: Fix stale HTAB during live migration (TCG)
+40a53a28c7 spapr: Fix stale HTAB during live migration (TCG)
+01a579729b spapr: Fix stale HTAB during live migration (KVM)
+ee188e87a5 spapr: Fix stale HTAB during live migration (KVM)
+f874bf905f exec: Handle multipage ranges in invalidate_and_set_dirty()
+b1958749a6 exec: Handle multipage ranges in invalidate_and_set_dirty()
+c21fd2c79e pc-bios: petalogix-s3adsp1800.dtb: Use 'xlnx, xps-ethernetlite-2.00.a' instead of 'xlnx, xps-ethernetlite-2.00.b'
+3ce29b30c3 pc-bios: petalogix-s3adsp1800.dtb: Use 'xlnx, xps-ethernetlite-2.00.a' instead of 'xlnx, xps-ethernetlite-2.00.b'
+d749e10c4f bootindex: move calling add_boot_device_patch to bootindex setter function
+9ef7749a6b bootindex: move calling add_boot_device_patch to bootindex setter function
+d2b186f96d ide: add calling add_boot_device_patch in bootindex setter function
+0b252a7a59 ide: add calling add_boot_device_patch in bootindex setter function
+89f0762dde usb-storage: add bootindex to qom property
+93204fc8b0 usb-storage: add bootindex to qom property
+bdbb5b1706 fw_cfg: add fw_cfg_machine_reset function
+121958508b fw_cfg: add fw_cfg_machine_reset function
+01ce352e62 ide: Add resize callback to ide/core
+664dd0afa0 ide: Add resize callback to ide/core
+07b81ed937 acpi-build: Set FORCE_APIC_CLUSTER_MODEL bit for FADT flags
+a64c8d8914 acpi-build: Set FORCE_APIC_CLUSTER_MODEL bit for FADT flags
+9db2efd95e x86: Clear MTRRs on vCPU reset
+74ca2b587b x86: Clear MTRRs on vCPU reset
+91d670fbf9 virtio-scsi: define dummy handle_output for vhost-scsi vqs
+f55fe779c0 virtio-scsi: define dummy handle_output for vhost-scsi vqs
+2a6593cb6a spapr: Add ibm, client-architecture-support call
+eaacd2f45c spapr: Add ibm, client-architecture-support call
+4cb88c3c37 s390x/kvm: enable/reset cmma via vm attributes
+f137d879da s390x/kvm: enable/reset cmma via vm attributes
+d880b28cef ipxe: update to current git
+f5aba82c5f ipxe: update to current git
+db76ec6291 seabios: update to 1.7.5-rc1
+dd4a358306 seabios: update to 1.7.5-rc1
+d197fdbc3b target-ppc: Reset SPRs on CPU reset
+d73ac80407 target-ppc: Reset SPRs on CPU reset
+c2cb92f9ea Merge remote-tracking branch 'remotes/borntraeger/tags/kvm-s390-20140227' into staging
+d830f1d6ab Merge remote-tracking branch 'remotes/borntraeger/tags/kvm-s390-20140227' into staging
+5d739a4787 s390-ccw.img: Fix sporadic errors with ccw boot image - initialize css
+8e20ae9bcf s390-ccw.img: Fix sporadic errors with ccw boot image - initialize css
+d1028f1b5b s390-ccw.img: Fix sporadic reboot hangs: Initialize next_idx
+216ffbe9d1 s390-ccw.img: Fix sporadic reboot hangs: Initialize next_idx
+cd4eb4c5ac Update seabios submodule to 1.7.4
+43979db1cc Update seabios submodule to 1.7.4
+f06b85218a qxl: clear irq on reset
+579fba114f qxl: clear irq on reset
+582b55a96a roms: Flush icache when writing roms to guest memory
+ed468f03d4 roms: Flush icache when writing roms to guest memory
+a94b36ddd6 roms: Flush icache when writing roms to guest memory
+d807d97374 roms: Flush icache when writing roms to guest memory
+11938d7863 roms: update seabios submodule to 31b8b4eea9d9ad58a73b22a6060d3ac1c419c26d
+964cba3610 roms: update seabios submodule to 31b8b4eea9d9ad58a73b22a6060d3ac1c419c26d
+6d0a373542 Merge tag 'for_anthony' of git://git.kernel.org/pub/scm/virt/kvm/mst/qemu
+d5e10e5613 Merge tag 'for_anthony' of git://git.kernel.org/pub/scm/virt/kvm/mst/qemu
+f772a83113 Merge remote-tracking branch 'mst/tags/for_anthony' into staging
+4d8becbeca Merge remote-tracking branch 'mst/tags/for_anthony' into staging
+df39076850 vl: allow "cont" from panicked state
+4c52644504 vl: allow "cont" from panicked state
+0624c7f916 e820: pass high memory too.
+8045c9b60e e820: pass high memory too.
+72c194f7e7 i386: ACPI table generation code from seabios
+d14e5e20eb i386: ACPI table generation code from seabios
+74523b8501 i386: add ACPI table files from seabios
+61ae5d39b2 i386: add ACPI table files from seabios
+1cf9412b3b update seabios from 1.7.2.2 to 1.7.3.2
+2877761088 update seabios from 1.7.2.2 to 1.7.3.2
+41b8280a1c seabios: update to 1.7.3
+6e81dccc73 seabios: update to 1.7.3
+39c93c67c5 s390/ipl: Fix spurious errors in virtio
+cbdde09918 s390/ipl: Fix spurious errors in virtio
+0a2b5e3a78 qxl: Call spice_qxl_driver_unload from qxl_enter_vga_mode
+f732756daa qxl: Call spice_qxl_driver_unload from qxl_enter_vga_mode
+cefd3cdbdd PPC: e500: initialize GPRs as per epapr
+c535999e42 PPC: e500: initialize GPRs as per epapr
+b8b7456d6a pc: Update rtc_cmos on CPU hot-plug
+0e3917b08b pc: Update rtc_cmos on CPU hot-plug
+ba66181828 vfio-pci: Move devices to D0 on reset
+1d009f2fee vfio-pci: Move devices to D0 on reset
+7076eabcbf qemu vfio-pci: Graphics device quirks
+469428d8d8 qemu vfio-pci: Graphics device quirks
+92dcc234ec Add support for cancelling of a TPM command
+c4ffa85500 Add support for cancelling of a TPM command
+39097daf15 qemu-ga: use key-value store to avoid recycling fd handles after restart
+36b1c89572 qemu-ga: use key-value store to avoid recycling fd handles after restart
+38dd7cc776 s390/css: Fix subchannel detection
+cbc98d030c s390/css: Fix subchannel detection
+71df81afc6 Merge remote-tracking branch 'stefanha/block' into staging
+b203105b1d Merge remote-tracking branch 'stefanha/block' into staging
+69b302b204 virtio-blk: fix unplug + virsh reboot
+e16859fd02 virtio-blk: fix unplug + virsh reboot
+bd4bd24ed3 Merge branch 'for-linux-user' of https://git.gitorious.org/qemu-m68k/qemu-m68k into staging
+04cccfa829 Merge branch 'for-linux-user' of https://git.gitorious.org/qemu-m68k/qemu-m68k into staging
+c07ecc6866 linux-user: correct reboot()
+b5522cd6b2 linux-user: correct reboot()
+1ec4ba7416 PIIX3: reset the VM when the Reset Control Register's RCPU bit gets set
+45ddc7ccf0 PIIX3: reset the VM when the Reset Control Register's RCPU bit gets set
+e0dfe5b189 openpic: add basic support for MPIC v4.2
+a85c42937c openpic: add basic support for MPIC v4.2
+e674a49aae s390: Move IPL code into a separate device
+153f05c5bf s390: Move IPL code into a separate device
+6a4784ce6b target-i386: Disable kvm_mmu by default
+6822cbc962 target-i386: Disable kvm_mmu by default
+f513cbf750 Add qemu-ga-client script
+e3816f78a5 Add qemu-ga-client script
+ac05f34924 add a boot parameter to set reboot timeout
+cbaa461d5a add a boot parameter to set reboot timeout
+4d09d37c6a reset PMBA and PMREGMISC PIIX4 registers.
+8b53dde45f reset PMBA and PMREGMISC PIIX4 registers.
+93b91c59db qemu-ga: switch to the new error format on the wire
+0071d6f937 qemu-ga: switch to the new error format on the wire
+dd86df756e Merge remote-tracking branch 'sstabellini/for_1.1_rc3' into staging
+d99e14b2bf Merge remote-tracking branch 'sstabellini/for_1.1_rc3' into staging
+180640ea07 Call xc_domain_shutdown with the reboot flag when the guest requests a reboot.
+14cf5a8274 Call xc_domain_shutdown with the reboot flag when the guest requests a reboot.
+174210fe70 Merge remote-tracking branch 'agraf/s390-for-upstream' into staging
+8696892500 Merge remote-tracking branch 'agraf/s390-for-upstream' into staging
+4170aea1a7 s390: reset avail and used index on reboot
+583205f309 s390: reset avail and used index on reboot
+add142e0aa S390: support reboot for kvm on s390
+de7fcd5e5a S390: support reboot for kvm on s390
+eb3caa44b0 S390: reboot: reset device pages on reboot
+5722baebd4 S390: reboot: reset device pages on reboot
+f789aa7baf qemu-ga: persist tracking of fsfreeze state via filesystem
+f29f0a2f15 qemu-ga: persist tracking of fsfreeze state via filesystem
+4d0365165d Merge branch 'ppc-for-upstream' of git://repo.or.cz/qemu/agraf
+3d725ff832 Merge branch 'ppc-for-upstream' of git://repo.or.cz/qemu/agraf
+c821a43c60 pseries: Implement RTAS system-reboot call
+c21f315a49 pseries: Implement RTAS system-reboot call
+7faa8075d8 acpi_piix4: Fix PCI hotplug race
+9367d9af49 acpi_piix4: Fix PCI hotplug race
+3cf0bed836 qemu-ga: add guest-sync-delimited
+0a0cb8b074 qemu-ga: add guest-sync-delimited
+069ab0eb8a hw/vmmouse.c: Disable vmmouse after reboot
+1864b94abb s390x: implement SIGP restart and shutdown
+47113ab6b8 reenable vm_clock when resuming all vcpus
+0f6b4d2112 linux-user: implement reboot syscall
+e69ae5c49a do not reset no_shutdown after we shutdown the vm
+3b88670664 Merge branch 'ppc-next' of git://repo.or.cz/qemu/agraf
+b0fb84236d PPC: E500: Implement reboot controller
+8b06c62ae4 seabios: update to latest git
+3c85e74fbf KVM, MCE, unpoison memory address across reboot
+cd19cfa236 Add qemu_ram_remap
+f487d6278f Update SeaBIOS to 0.6.1.2
+36888c6335 Watchdog: disable watchdog timer when hard-rebooting a guest.
+fa82e9c300 wdt_i6300esb: register a reset function
+758c309f0a seabios: Update to 0.6.1
+8e84865e54 migration: Accept 'cont' only after successful incoming migration
+ec5f92ce6a hw: better i440 emulation
+7ffb82ca6e kbd keds: vnc
+af364b418c MCE: Fix bug of IA32_MCG_STATUS after system reset
+c169998802 v3: don't call reset functions on cpu initialization
+3c178e72e0 rom loader: fix sparc -kernel boot.
+e0f084bfc9 Add boot-once support
+c8075ac370 Register usb-uhci reset function.
+d6ecb03610 reset state for load_linux
+274fb0e1ed check SCSI read/write requests against max LBA (Rik van Riel)
+deeccef389 Add reset irq state for ps2 reboot callback (Dor Laor)
+4abc796d41 Add cirrus reset handler
+e976c6a1e4 Change order of metadata update to prevent loosing guest data because of unexpected exit (Gleb Natapov)
+23e6c39908 Fix task register type after reset (Avi Kivity)
+0686970f81 Avoid Linux to stay stucked in an infinite loop when requesting a reboot.
+6ae817752b Halt/reboot support for Linux, by Daniel Jacobowitz. This is a band-aid until we emulate real MIPS hardware with real firmware.
+d1beab8220 no-reboot option

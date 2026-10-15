@@ -256,7 +256,6 @@ typedef struct {
 	 */
 	uint16_t kbd_ring[256];   /* queued unichars */
 	unsigned kbd_head, kbd_tail;
-	bool kbd_cmd;             /* host Command/Meta held */
 	bool kbd_shift;           /* host Shift held */
 
 	/*

@@ -2106,23 +2106,20 @@ static void ipod_touch_kbd_rotate(bool clockwise)
 
 /*
  * Which host keys are currently holding a guest button down, so the release can
- * always be delivered. The button path is gated on Command being held, but
- * releasing Command before the key is natural, and then the key-up fell through
- * to the text path and the button GPIO stayed asserted forever - iOS saw the
- * volume button held and ramped the volume continuously.
+ * always be delivered.
  */
 static int s_kbd_btn_held[Q_KEY_CODE__MAX];
 
-static void ipod_touch_kbd_button(int qcode, bool shift, bool down)
+static void ipod_touch_kbd_button(int qcode, bool down)
 {
 	int base = -1;
 	switch (qcode) {
-	case Q_KEY_CODE_L: base = KEY_P; break;          /* Command+L      -> power */
-	case Q_KEY_CODE_H: if (shift) base = KEY_H; break;/* Command+Shift+H-> home  */
-	case Q_KEY_CODE_MINUS: base = KEY_MIN; break;    /* Command+-      -> vol dn */
-	case Q_KEY_CODE_EQUAL: base = KEY_PLUS; break;   /* Command+=      -> vol up */
-	case Q_KEY_CODE_LEFT:                            /* Command+Left   -> rotate ccw */
-	case Q_KEY_CODE_RIGHT:                           /* Command+Right  -> rotate cw  */
+	case Q_KEY_CODE_P:     base = KEY_P;    break; /* P -> power */
+	case Q_KEY_CODE_H:     base = KEY_H;    break; /* H -> home  */
+	case Q_KEY_CODE_MINUS: base = KEY_MIN;  break; /* - -> vol dn */
+	case Q_KEY_CODE_EQUAL: base = KEY_PLUS; break; /* = -> vol up */
+	case Q_KEY_CODE_LEFT:                          /* Left  -> rotate ccw */
+	case Q_KEY_CODE_RIGHT:                         /* Right -> rotate cw  */
 		if (down) {
 			ipod_touch_kbd_rotate(qcode == Q_KEY_CODE_RIGHT);
 		}
@@ -2153,10 +2150,6 @@ static void ipod_touch_kbd_event(DeviceState *dev, QemuConsole *src,
 	}
 
 	switch (q) {
-	case Q_KEY_CODE_META_L:
-	case Q_KEY_CODE_META_R:
-		nms->kbd_cmd = down;
-		return;
 	case Q_KEY_CODE_SHIFT:
 	case Q_KEY_CODE_SHIFT_R:
 		nms->kbd_shift = down;
@@ -2166,8 +2159,7 @@ static void ipod_touch_kbd_event(DeviceState *dev, QemuConsole *src,
 	}
 
 	/*
-	 * A key that is currently holding a button down must always release it,
-	 * even if Command was let go first.
+	 * A key that is currently holding a button down must always release it.
 	 */
 	if (!down && q >= 0 && q < Q_KEY_CODE__MAX && s_kbd_btn_held[q]) {
 		int base = s_kbd_btn_held[q];
@@ -2178,10 +2170,19 @@ static void ipod_touch_kbd_event(DeviceState *dev, QemuConsole *src,
 		return;
 	}
 
-	if (nms->kbd_cmd) {
-		/* buttons live behind Command now */
-		ipod_touch_kbd_button(q, nms->kbd_shift, down);
+	/*
+	 * H/P/-/= map directly to hardware buttons (home, power, vol-dn, vol-up).
+	 * H/P/-/= for the hardware buttons.
+	 */
+	switch (q) {
+	case Q_KEY_CODE_H:
+	case Q_KEY_CODE_P:
+	case Q_KEY_CODE_MINUS:
+	case Q_KEY_CODE_EQUAL:
+		ipod_touch_kbd_button(q, down);
 		return;
+	default:
+		break;
 	}
 
 	if (down) {
@@ -2385,7 +2386,7 @@ static void ipod_touch_powerdown_arm(IPodTouchMachineState *nms, int ms)
 /*
  * Press or release a hardware button from a host UI that has no keyboard.
  *
- * On a Mac the four buttons are Command combos routed through
+ * On a Mac/Linux the four buttons are Command/Alt combos routed through
  * ipod_touch_kbd_button(); a phone has nowhere to type them, and without the
  * power and home buttons an emulated device that sleeps can never be woken.
  * This is the same key path, addressed by name instead of by keystroke.

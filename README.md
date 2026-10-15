@@ -43,6 +43,7 @@ is the wire contract).
 | `imgtools/lldb` | lldb scripting for guest debugging (`xnu.py`). Devices are made by LightTouchMac's Swift FirmwareKit: `firmwarekit create --catalog CATALOG --id BOARD-BUILD --ipsw IPSW --out OUT` (CATALOG: LightTouchMac's `LightTouchMac/Resources/firmware-catalog.json`; k48ap and 4.x n72ap also take `--helper` with the LightTouchDevice executable) |
 | `tests/slice/`, `tests/ipod/`, `tests/ipad1/`, `tests/guest-package/` | The gates below |
 | `scripts/ccninja`, `scripts/configure-patched-ffmpeg` | Build helpers |
+| `tools/` | Linux Python port `firmwarekit.py` for creating device firmware bundles from IPSWs (see `tools/README.md`) |
 | `docs/` | Ours are the `.md` files; the `.rst`/`.txt` tree is upstream QEMU's. See "Documentation" |
 
 Firmware, images and the private work area (`~/Developer/qemu-ios-files`) are never in the repository.

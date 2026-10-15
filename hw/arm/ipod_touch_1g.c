@@ -649,28 +649,15 @@ static void n45_kbd_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
     int q = qemu_input_key_value_to_qcode(k->key);
 
     switch (q) {
-    case Q_KEY_CODE_META_L:
-    case Q_KEY_CODE_META_R:
-        s->kbd_cmd = k->down;
-        return;
-    case Q_KEY_CODE_SHIFT:
-    case Q_KEY_CODE_SHIFT_R:
-        s->kbd_shift = k->down;
-        return;
     case Q_KEY_CODE_H:
-        if (!k->down || (s->kbd_cmd && s->kbd_shift)) {
-            n45_button(s, s->board->home_gpio, s->board->home_irq, k->down);
-        }
+        n45_button(s, s->board->home_gpio, s->board->home_irq, k->down);
         return;
-    case Q_KEY_CODE_L:
-        if (!k->down || s->kbd_cmd) {
-            n45_button(s, s->board->power_gpio, s->board->power_irq, k->down);
-        }
+    case Q_KEY_CODE_P:
+        n45_button(s, s->board->power_gpio, s->board->power_irq, k->down);
         return;
     case Q_KEY_CODE_MINUS:
     case Q_KEY_CODE_EQUAL:
-        /* Cmd+- / Cmd+= : the M68's volume buttons, the 2G's chords */
-        if (s->board->volup_gpio && (!k->down || s->kbd_cmd)) {
+        if (s->board->volup_gpio) {
             bool up = q == Q_KEY_CODE_EQUAL;
             n45_button(s, up ? s->board->volup_gpio : s->board->voldown_gpio,
                        up ? s->board->volup_irq : s->board->voldown_irq, k->down);
