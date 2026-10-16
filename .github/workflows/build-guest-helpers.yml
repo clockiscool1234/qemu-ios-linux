@@ -1,0 +1,93 @@
+## Build it_keybag (armv7) for the iPhone 4 / iPad / iPod touch 4G boards.
+##
+## it_keybag is the iOS 4.x restore-ramdisk one-shot that formats effaceable
+## storage and creates /private/var/keybags/systembag.kb. Without it, a 4.x
+## device built on Linux boots into a launchd reboot loop (keybagd: kb_load).
+##
+## Needs (all on the macOS runner):
+##   1. Xcode's clang + ld (via xcrun)          -> preinstalled
+##   2. The iPhoneOS 3.2 SDK (usr/ only is enough) -> IPHONEOS_SDK_URL secret
+##   3. ldid for ad-hoc signing                  -> brew
+##
+## Secret IPHONEOS_SDK_URL: a URL curl can fetch WITHOUT logging in (e.g. a
+## presigned link) to a tar.gz laid out as:
+##
+##   sdks/
+##     iPhoneOS3.2.sdk/
+##       SDKSettings.plist
+##       usr/...
+##
+## The SDK is Apple's and not redistributable: keep that URL private.
+
+name: Build it_keybag
+
+on:
+  push:
+    paths:
+      - 'contrib/it-keybag/**'
+      - 'contrib/armv6-toolchain/**'
+      - '.github/workflows/build-guest-helpers.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version || true
+          xcrun clang --version | head -1
+          xcrun ld -v 2>&1 | head -2 || true
+
+      - name: Download iPhoneOS 3.2 SDK
+        env:
+          SDK_URL: ${{ secrets.IPHONEOS_SDK_URL }}
+        run: |
+          if [ -z "$SDK_URL" ]; then
+            echo "::error::IPHONEOS_SDK_URL secret is not set."
+            exit 1
+          fi
+          mkdir -p "$HOME/iPhoneOS-SDKs"
+          curl -fSL "$SDK_URL" | tar xz -C "$HOME/iPhoneOS-SDKs" --strip-components=1
+          SDK="$HOME/iPhoneOS-SDKs/iPhoneOS3.2.sdk"
+          test -d "$SDK/usr/include" || { echo "::error::SDK layout wrong, expected sdks/iPhoneOS3.2.sdk/usr"; ls -R "$HOME/iPhoneOS-SDKs" | head -30; exit 1; }
+          echo "── libSystem stub ──"
+          lipo -info "$SDK/usr/lib/libSystem.B.dylib"
+          lipo -info "$SDK/usr/lib/libSystem.B.dylib" | grep -q armv7 \
+            || { echo "::error::libSystem stub has no armv7 slice"; exit 1; }
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build it_keybag (armv7)
+        run: |
+          set -eu
+          export GUEST_ARCH=armv7
+          export ARMV6_SDK="$HOME/iPhoneOS-SDKs/iPhoneOS3.2.sdk"
+          . contrib/armv6-toolchain/armv6.sh
+          mkdir -p build/ipad1-guest
+          cc6 contrib/it-keybag/it_keybag.c build/ipad1-guest/it_keybag.o
+          link6 -execute build/ipad1-guest/it_keybag build/ipad1-guest/it_keybag.o
+          rm -f build/ipad1-guest/it_keybag.o
+          ldid -S build/ipad1-guest/it_keybag
+          chmod +x build/ipad1-guest/it_keybag
+          echo "── result ──"
+          ls -l build/ipad1-guest/it_keybag
+          file build/ipad1-guest/it_keybag
+          shasum -a 256 build/ipad1-guest/it_keybag
+
+      # upload-artifact zips files and drops the exec bit: after downloading,
+      # run `chmod +x it_keybag` before passing it to --helper.
+      - name: Upload it_keybag
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: it_keybag-armv7
+          path: build/ipad1-guest/it_keybag
+          if-no-files-found: error
+          retention-days: 90
