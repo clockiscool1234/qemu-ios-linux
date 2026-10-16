@@ -93,13 +93,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
+        # libavcodec-dev + libavutil-dev enable IT_HAVE_AVCODEC so the full AMC
+        # audio-decode path (including amc_local / amc_engine0) is compiled and
+        # linked; without them only the non-avcodec code paths are tested.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential make ninja-build pkg-config \
             python3 python3-venv python3-pip git ccache \
             libssl-dev libsdl2-dev libpixman-1-dev libglib2.0-dev \
-            libslirp-dev libfdt-dev zlib1g-dev
+            libslirp-dev libfdt-dev zlib1g-dev \
+            libavcodec-dev libavutil-dev
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
