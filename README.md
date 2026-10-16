@@ -1,4 +1,4 @@
-# QEMU-iOS
+# QEMU-iOS-Linux
 
 Built with use from agentic coding products.
 
@@ -19,17 +19,11 @@ host GL bridge. It is the emulator inside [Light Touch](https://github.com/samhe
 | `ipad1` | iPad (k48ap) | A4 (S5L8930) | `docs/ipad1/README.md` |
 
 Which firmware builds each board runs, and how well, is tracked in Light Touch's firmware catalog
-(`LightTouchMac/Resources/firmware-catalog.json`): every build is prepared from Apple's stock IPSW.
+(`LightTouchMac/Resources/firmware-catalog.json`, in this repo its at `tools/firmware-catalog.json`): every build is prepared from Apple's stock IPSW.
 
 Shared between the boards: the host GL executor (`hw/arm/gles-host*.c`), the guest-service hypercalls
 (`hw/arm/guest-services.c`, `guest-gles.c`, `guest-pasteboard.c`, `guest-package.c`), the typed guest
 agent RPC (`hw/arm/ipod-agent.c`) and the baseband model (`hw/misc/ios_baseband*.c`, `docs/baseband/`).
-
-Light Touch is three repositories: this emulator; the macOS app
-[LightTouchMac](https://github.com/samhenrigold/LightTouchMac), which links it as `libqemu-arm.dylib`
-and ships the guest tools built from `contrib/`; and a [usbmuxd fork](https://github.com/samhenrigold/usbmuxd)
-(branch `idle-poll`) that carries the emulated USB device to libimobiledevice (`docs/tcp-usb-protocol.md`
-is the wire contract).
 
 ## What is where
 
@@ -46,39 +40,22 @@ is the wire contract).
 | `tools/` | Linux Python port `firmwarekit.py` for creating device firmware bundles from IPSWs (see `tools/README.md`) |
 | `docs/` | Ours are the `.md` files; the `.rst`/`.txt` tree is upstream QEMU's. See "Documentation" |
 
-Firmware, images and the private work area (`~/Developer/qemu-ios-files`) are never in the repository.
-
 ## Build
-
-Configure against the patched FFmpeg, not Homebrew's: the iPod H.264 bridge needs
-`contrib/ffmpeg/h264-chunk-er.patch`, and a tree linked against stock FFmpeg fails
-`tests/slice/ipod-h264-slices.c` while looking identical. The helper defaults
-`FFMPEG_PREFIX` to the prefix `~/Developer/qemu-ios/build-native14` was built with.
-
+Installing dependencies
 ```sh
-mkdir build && cd build
-../scripts/configure-patched-ffmpeg          # meson configure: arm-softmmu, headless (no SDL)
-../scripts/ccninja qemu-system-arm           # ninja through ccache, one cache for every worktree
+sudo apt install make ninja-build pkg-config libssl-dev libsdl2-dev libpixman-1-dev libpixman-1-0 libglib2.0-dev
+```
+Cloning the project:
+```sh
+git clone https://github.com/clockiscool1234/qemu-ios-linux
 ```
 
-`scripts/ccninja` puts Homebrew's ccache masquerade directory on `PATH` (the configured compiler is bare
-`cc`) and sets `CCACHE_BASEDIR=~/Developer`, so a fresh worktree builds in seconds at a warm cache.
-
-The app's library is a relink of the same objects: `contrib/macos-app/make-dylib-macos.sh BUILD_DIR`
-writes `BUILD_DIR/libqemu-arm.dylib`, exporting only the `qemu_ios_*` ABI. LightTouchMac's
-`Configuration/Shared.xcconfig` points `QEMU_IOS_DIR`/`QEMU_BUILD_DIR` at a checkout and such a build
-directory.
-
-**The contract with LightTouchMac** is `contrib/export-guest-artifacts.sh OUT [BUILD_DIR]`: it builds every
-guest component from a copy of `contrib/*` (through `contrib/guest-package/build.sh`, so the checkout is
-never written) and stages what the app consumes — `guest-tools/` (the iPod set), `ipad-guest-tools/` (the
-flat set `firmwarekit` reads: helpers, AppSync, the two GL engines with `gles-names.h`, the `.itpack`s
-at `contrib/guest-package/VERSION`'s serial), `macos-app/entitlements.plist`, `include/`, and with a build
-directory `dylib/libqemu-arm.dylib` — with `manifest.json` (source commit, branch, dirty flag, sha256 of
-every input and every staged file). LightTouchMac pins this repository by commit in
-`build-support/sources.json`; its `scripts/build-guest-tools.sh` is a thin caller of the export, and its
-release build validates the staged tree against the manifest. Bump the pin when the guest tools, the
-helper ABI or the entitlements change.
+Building QEMU:
+```sh
+mkdir build && cd build
+../configure --enable-sdl --disable-cocoa --target-list=arm-softmmu --disable-capstone --extra-cflags=-I/usr/include/openssl --extra-ldflags='-lcrypto' --disable-werror --enable-pie
+make -j$(nproc)
+```
 
 ## Creating a device bundle (FirmwareKit)
 
@@ -94,7 +71,7 @@ sudo apt-get install -y python3 hfsprogs libssl-dev
 For A4 devices on iOS 4.x/5.x (iPhone 4 `n90ap`, iPad 1 `k48ap`, iPod touch 4G `n81ap`), iOS requires Data Protection keybag provisioning (`/private/var/keybags/systembag.kb` and a formatted NOR effaceable storage). Without this provisioning, the guest loops in `keybagd: kb_load`.
 
 1. **Obtain `it_keybag`**:
-   - Build the armv7 helper using GitHub Actions ([`.github/workflows/build-guest-helpers.yml`](file:///home/pc/Documents/qemu-ios/.github/workflows/build-guest-helpers.yml)) or via an Xcode/armv7 toolchain.
+   - Build the armv7 helper using GitHub Actions ([`.github/workflows/build-guest-helpers.yml`](.github/workflows/build-guest-helpers.yml)) or via an Xcode/armv7 toolchain.
    - Place the compiled binary at `tools/it_keybag` and ensure it is executable (`chmod +x tools/it_keybag`).
    - `firmwarekit.py` automatically detects `tools/it_keybag` (or you can specify `--helper /path/to/it_keybag`).
 
@@ -123,7 +100,7 @@ For A4 devices on iOS 4.x/5.x (iPhone 4 `n90ap`, iPad 1 `k48ap`, iPod touch 4G `
    ./run.sh
    ```
 
-For all other supported boards (iPhone 2G `m68ap`, iPod touch 1G/2G/3G/4G, iPad 1 `k48ap`, iPhone 3GS `n88ap`), options, and controls, see [tools/README.md](file:///home/pc/Documents/qemu-ios/tools/README.md).
+For all other supported boards (iPhone 2G `m68ap`, iPod touch 1G/2G/3G/4G, iPad 1 `k48ap`, iPhone 3GS `n88ap`), options, and controls, see [tools/README.md](tools/README.md).
 
 
 ## Gates

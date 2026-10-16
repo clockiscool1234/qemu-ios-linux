@@ -2025,6 +2025,11 @@ def run_keybag_provisioning(args, qemu_machine, dec_dir, ident_path,
         target_dir = os.path.join(m, "usr", "local", "bin")
         os.makedirs(target_dir, exist_ok=True)
         target = os.path.join(target_dir, "restored_external")
+        # The stock file is HFS+-compressed (UF_COMPRESSED + com.apple.decmpfs). Overwriting its
+        # data fork leaves that flag and attribute behind, and iOS then reads the stock binary
+        # from the attribute. Unlink first so the new file is a plain uncompressed one.
+        if os.path.lexists(target):
+            os.unlink(target)
         shutil.copyfile(helper, target)
         os.chmod(target, 0o755)
         try:
@@ -2086,7 +2091,7 @@ def run_keybag_provisioning(args, qemu_machine, dec_dir, ident_path,
             "-no-reboot",
         ]
         t0 = time.monotonic()
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=None)
         text = ""
         try:
             while p.poll() is None and (time.monotonic() - t0) < timeout:

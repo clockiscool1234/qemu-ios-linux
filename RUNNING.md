@@ -1,3 +1,5 @@
+# NOTE: this will soon be replaced, so do not follow these instructructions
+
 ## Running the iPod Touch 2G Emulator
 
 This file contains the instructions on how to run the iPod Touch 2G emulator using QEMU.
