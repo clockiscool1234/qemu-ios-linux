@@ -1169,7 +1169,8 @@ class _Image:
 def _act_parse(m):
     d, n = m.b, m.n
     if n < 28 or m.u32(0) != 0xFEEDFACE or m.u32(4) != 12 or m.u32(12) != 2:
-        raise ActivationError("expected a thin little-endian 32-bit ARM Mach-O executable")
+        seen = ("magic 0x%08x, cputype %d, filetype %d" % (m.u32(0), m.u32(4), m.u32(12))) if n >= 16 else "%d bytes" % n
+        raise ActivationError("expected a thin little-endian 32-bit ARM Mach-O executable (found %s)" % seen)
     count, commands = m.u32(16), m.u32(20)
     if not m.fits(28, commands, n) or count > commands // 8:
         raise ActivationError("invalid load commands")
@@ -1629,7 +1630,7 @@ def resign_lockdownd(data, sig):
     return bytes(b)
 
 
-def activate_lockdownd(data, allow_signed_era=True, resign=True):
+def _activate_thin(data, allow_signed_era=True, resign=True):
     """-> (patched bytes, report).  Raises ActivationError (the input is never modified in place).
     A signed binary, or a signed-era match, comes back re-signed (ad hoc); the unsigned 1.x path stays
     unsigned.  allow_signed_era=False restores the 1.x-only behaviour; resign=False patches the bytes only,
@@ -1657,6 +1658,55 @@ def activate_lockdownd(data, allow_signed_era=True, resign=True):
     }
 
 
+def _fat_arm_slices(data):
+    """[(cpusubtype, offset, size)] of the 32-bit ARM slices of a fat (universal) Mach-O; None if `data`
+    is not fat.  iOS 4.x system daemons ship as armv6 + armv7 fat binaries."""
+    if len(data) < 8 or struct.unpack_from(">I", data, 0)[0] != 0xCAFEBABE:
+        return None
+    n = struct.unpack_from(">I", data, 4)[0]
+    if not 0 < n <= 16 or 8 + 20 * n > len(data):
+        raise ActivationError("invalid fat Mach-O header")
+    out = []
+    for i in range(n):
+        cputype, subtype, off, size, _align = struct.unpack_from(">5I", data, 8 + 20 * i)
+        if off + size > len(data) or size < 28:
+            raise ActivationError("invalid fat Mach-O slice")
+        if cputype == 12:
+            out.append((subtype & 0x00FFFFFF, off, size))
+    return out
+
+
+def activate_lockdownd(data, allow_signed_era=True, resign=True):
+    """-> (patched bytes, report).  Like _activate_thin, and also accepts a fat (armv6 + armv7) lockdownd:
+    every 32-bit ARM slice is patched and re-signed in place, the file keeps its layout.  The newest slice
+    (armv7, what the A4 boards run) must patch, or this raises; an older slice that cannot be patched is
+    left stock and listed in report["skipped_slices"], since the newest CPU never executes it."""
+    slices = _fat_arm_slices(data)
+    if slices is None:
+        return _activate_thin(data, allow_signed_era, resign)
+    if not slices:
+        raise ActivationError("fat Mach-O has no 32-bit ARM slice")
+    newest = max(sub for sub, _off, _size in slices)
+    out, rep, skipped = bytearray(data), None, []
+    for sub, off, size in sorted(slices):
+        try:
+            patched, r = _activate_thin(bytes(data[off:off + size]), allow_signed_era, resign)
+        except ActivationError as e:
+            if sub == newest:
+                raise ActivationError("armv%d slice: %s" % (sub, e))
+            skipped.append("armv%d: %s" % (sub, e))
+            continue
+        if len(patched) != size:
+            raise ActivationError("patched slice changed size")
+        out[off:off + size] = patched
+        if sub == newest:
+            rep = dict(r, offset=r["offset"] + off, slice="armv%d" % sub)
+    rep["skipped_slices"] = skipped
+    rep["input_sha256"] = hashlib.sha256(data).hexdigest()
+    rep["output_sha256"] = hashlib.sha256(bytes(out)).hexdigest()
+    return bytes(out), rep
+
+
 LOCKDOWND = "usr/libexec/lockdownd"
 
 
@@ -1665,6 +1715,18 @@ def activate_volume(m, log=print):
     path = os.path.join(m, LOCKDOWND)
     with open(path, "rb") as f:
         before = f.read()
+    if not before:
+        # The Linux hfsplus driver shows an HFS+-compressed file (UF_COMPRESSED + com.apple.decmpfs) as an
+        # empty data fork: the content lives in the decmpfs attribute / resource fork, which it cannot read.
+        try:
+            attrs = os.listxattr(path)
+        except OSError:
+            attrs = []
+        if any("decmpfs" in a for a in attrs):
+            raise ActivationError("%s is HFS+-compressed (data fork is empty, xattrs: %s); patching "
+                                  "compressed files is not supported" % (LOCKDOWND, ", ".join(attrs)))
+        raise ActivationError("%s reads as 0 bytes on the mounted volume (xattrs: %s)"
+                              % (LOCKDOWND, ", ".join(attrs) or "none"))
     after, rep = activate_lockdownd(before)
     mode = os.stat(path).st_mode & 0o7777
     os.chmod(path, mode | 0o200)
@@ -2000,6 +2062,10 @@ def activate_kboot_rootfs(system_img, work, log=print):
         rep = with_mounted(system_img, mnt, lambda m: activate_volume(m, log))
         print("  lockdownd: %s -> %s" % (rep["input_sha256"][:12], rep["output_sha256"][:12]))
         return rep
+    except ActivationError as e:
+        print("warning: lockdownd was NOT activated (%s)" % e)
+        print("         the patcher rejected this lockdownd; the device will stop at \"Connect to iTunes\"")
+        return None
     except FirmwareError as e:
         print("warning: lockdownd was NOT activated (%s)" % e)
         print("         rerun as root, or pass --skip-activation to silence this")
@@ -2383,6 +2449,48 @@ _BOARD_CREATORS = {
 }
 
 
+def invoking_user():
+    """(uid, gid) of the real user when running as root through sudo or pkexec, else None."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    try:
+        if os.environ.get("SUDO_UID"):
+            uid = int(os.environ["SUDO_UID"])
+            return uid, int(os.environ.get("SUDO_GID") or uid)
+        if os.environ.get("PKEXEC_UID"):
+            import pwd
+            uid = int(os.environ["PKEXEC_UID"])
+            return uid, pwd.getpwuid(uid).pw_gid
+    except (ValueError, KeyError):
+        pass
+    return None
+
+
+def hand_back_ownership(path):
+    """Give a bundle that was built as root (sudo/pkexec) to the user who asked for it.
+
+    Several boards need root to loop-mount the HFS+ rootfs, which leaves nor.bin, nand/ and the rest
+    root-owned; QEMU then fails with "Could not open '.../nor.bin': Permission denied" when the user
+    starts the device.  Symlinks are re-owned themselves, never followed.  A no-op when not root or
+    when the invoking user is unknown (a real root login).  Returns the number of paths changed."""
+    who = invoking_user()
+    if who is None or not os.path.isdir(path):
+        return 0
+    uid, gid = who
+    n = 0
+    for root, dirs, files in os.walk(path):
+        for name in [""] + dirs + files:
+            p = os.path.join(root, name) if name else root
+            try:
+                st = os.lstat(p)
+                if st.st_uid != uid or st.st_gid != gid:
+                    os.lchown(p, uid, gid)
+                    n += 1
+            except OSError:
+                pass
+    return n
+
+
 def create(args):
     entry = catalog_entry(args.catalog, args.id)
     board = entry.get("board", "")
@@ -2413,7 +2521,12 @@ def create(args):
     tmp_prefix = BOARD_META[board][1]
     work = args.work or tempfile.mkdtemp(prefix=tmp_prefix + "-", dir=args.tmpdir)
     os.makedirs(work, exist_ok=True)
-    _BOARD_CREATORS[board](args, entry, ipsw, ri, out, work)
+    try:
+        _BOARD_CREATORS[board](args, entry, ipsw, ri, out, work)
+    finally:
+        n = hand_back_ownership(out)       # also after a failure: no root-owned leftovers to clean up
+        if n:
+            print("ownership of %s returned to the invoking user (%d paths)" % (out, n))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2987,6 +3100,46 @@ def selftest(_args):
             check("activation: a corrupt SuperBlob is refused", False)
         except ActivationError:
             check("activation: a corrupt SuperBlob is refused", True)
+
+        # fat (universal) lockdownd, as iOS 4.x ships it: armv6 + armv7 slices
+        def _fat(slices):
+            hdr = struct.pack(">II", 0xCAFEBABE, len(slices))
+            body, pos, ents = b"", 0x4000, b""
+            for sub, blob in slices:
+                ents += struct.pack(">5I", 12, sub, pos, len(blob), 14)
+                body += bytes(pos - 0x4000 - len(body)) + blob
+                pos = (pos + len(blob) + 0x3FFF) & ~0x3FFF
+            raw = hdr + ents
+            return raw + bytes(0x4000 - len(raw)) + body
+        v7, start7, _ = _synth_signed(SYNTH_KINDS["conditional"]())
+        v6 = _Synth().build()                       # a stock armv6 slice with no activation path
+        fat = _fat([(6, v6), (9, v7)])
+        try:
+            out, rep = activate_lockdownd(fat)
+            o7 = 0x4000 + (len(v6) + 0x3FFF & ~0x3FFF)
+            sl = out[o7:o7 + len(v7)]
+            good = (len(out) == len(fat) and rep["slice"] == "armv9" and len(rep["skipped_slices"]) == 1
+                    and out[0x4000:0x4000 + len(v6)] == v6                              # armv6 untouched
+                    and sl != v7 and _sig_pages_ok(sl, start7, 1)                       # armv7 patched, re-signed
+                    and out[:0x4000] == fat[:0x4000]                                    # fat header intact
+                    and rep["offset"] >= o7 and rep["resigned"])
+        except FirmwareError as e:
+            good = False
+            print("    ", e)
+        check("activation: fat lockdownd: armv7 slice patched and re-signed, armv6 left stock", good)
+        try:
+            activate_lockdownd(_fat([(6, v7), (9, v6)]))
+            check("activation: fat lockdownd: unpatchable armv7 slice is refused", False)
+        except ActivationError as e:
+            check("activation: fat lockdownd: unpatchable armv7 slice is refused", "armv9" in str(e), str(e))
+        out, rep = activate_lockdownd(_fat([(6, v7), (9, v7)]))
+        check("activation: fat lockdownd: both slices patched when both can be", rep["skipped_slices"] == []
+              and out.count(bytes.fromhex(rep["replacement"])) >= 2)
+        try:
+            activate_lockdownd(struct.pack(">II", 0xCAFEBABE, 0) + bytes(64))
+            check("activation: refuses a fat header with no slices", False)
+        except ActivationError:
+            check("activation: refuses a fat header with no slices", True)
 
     # bootrom bundling: resolve, copy into the device folder, run.sh prefers the copy from any cwd
     d = tempfile.mkdtemp(prefix="bootrom-selftest-")

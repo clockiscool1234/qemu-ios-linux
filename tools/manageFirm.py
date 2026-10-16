@@ -30,9 +30,11 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -180,6 +182,7 @@ DEVICES: dict = {
 _TOOLS_DIR  = Path(__file__).resolve().parent        # tools/
 REPO_ROOT   = _TOOLS_DIR.parent
 FIRMWAREKIT = _TOOLS_DIR / "firmwarekit.py"
+TOUCH_PANEL = _TOOLS_DIR / "touchPanel.py"
 DEFAULT_CAT = REPO_ROOT / "iphone" / "firmware-catalog.json"
 IPSW_ME_API = "https://api.ipsw.me/v4/ipsw/{product}/{build}"
 _UA         = "qemu-ios-manageFirm/1.0"
@@ -373,6 +376,39 @@ def scan_devices(base: Path, prefix: str = DEFAULT_PREFIX) -> list:
             "identity":    identity,
         })
     return out
+
+
+def prepare_touch_panel(env: dict, qemu: str) -> Optional[dict]:
+    """Make run.sh start QEMU with a QMP socket and without the SDL window.
+
+    run.sh ends in `exec ${QEMU:-qemu-system-arm} ... -display sdl,...`, so QEMU is
+    pointed at a one-line wrapper that runs `touchPanel.py --exec-qemu`; that adds
+    `-qmp unix:SOCK,server,nowait`, swaps the display for `-display none` and execs
+    the real binary (passed in LT_REAL_QEMU).  Updates `env` in place and returns
+    {"dir", "sock"} (the caller removes "dir" when QEMU exits), or None if the
+    panel script is missing.
+    """
+    if not TOUCH_PANEL.is_file():
+        return None
+    tmp = tempfile.mkdtemp(prefix="qemu-ios-panel-")       # short path: unix sockets cap at ~107 bytes
+    wrapper = Path(tmp) / "qemu-wrapper.sh"
+    wrapper.write_text("#!/bin/sh\nexec {} {} --exec-qemu \"$@\"\n".format(
+        shlex.quote(sys.executable), shlex.quote(str(TOUCH_PANEL))))
+    wrapper.chmod(0o755)
+    sock = str(Path(tmp) / "qmp.sock")
+    env["LT_REAL_QEMU"]    = qemu
+    env["LT_QMP_SOCK"]     = sock
+    env["LT_HIDE_DISPLAY"] = "1"
+    env["QEMU"]            = str(wrapper)
+    return {"dir": tmp, "sock": sock}
+
+
+def spawn_touch_panel(sock: str, title: str) -> subprocess.Popen:
+    """Open the touch panel window for the QEMU listening on QMP socket `sock`."""
+    return subprocess.Popen(
+        [sys.executable, str(TOUCH_PANEL), "--qmp", sock, "--title", title],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        errors="replace")
 
 
 def locate_qemu() -> Optional[str]:
@@ -935,6 +971,9 @@ class App(tk.Tk):
         self._catalog = catalog
         self._devs: list    = []
         self._running: dict = {}   # path_str → subprocess.Popen
+        self._panels: dict  = {}   # path_str → {"dir", "sock", "title", "proc"}
+        self._panel_var = tk.BooleanVar(
+            value=bool(load_config().get("touch_panel", True)))
 
         self._build_ui()
         self.refresh()
@@ -961,6 +1000,12 @@ class App(tk.Tk):
         tb_btn("▶  Start",     self._start_device)
         tb_btn("■  Stop",      self._stop_device)
         tb_btn("✕  Delete",    self._delete_device)
+        ttk.Separator(tb, orient="vertical").pack(
+            side="left", fill="y", padx=6, pady=2)
+        ttk.Checkbutton(
+            tb, text="Touch panel", variable=self._panel_var,
+            command=self._panel_pref_changed).pack(side="left", padx=3)
+        tb_btn("☝  Panel", self._reopen_panel)
         ttk.Separator(tb, orient="vertical").pack(
             side="left", fill="y", padx=6, pady=2)
         tb_btn("↺  Refresh",  self.refresh)
@@ -1080,7 +1125,9 @@ class App(tk.Tk):
         self._base, self._prefix = base, prefix
         self._update_base_label()
         try:
-            save_config({"base": str(base), "prefix": prefix})
+            cfg = load_config()
+            cfg.update({"base": str(base), "prefix": prefix})
+            save_config(cfg)
         except OSError as exc:
             messagebox.showwarning(
                 "Settings not saved",
@@ -1147,6 +1194,14 @@ class App(tk.Tk):
         label  = "{device_name}  [{board}-{build}]".format(**d)
         self.log("Starting {}  •  QEMU={}".format(label, qemu))
 
+        # Touch panel: QMP socket + no SDL window (see prepare_touch_panel)
+        panel = None
+        if self._panel_var.get():
+            panel = prepare_touch_panel(env, qemu)
+            if panel is None:
+                self.log("  touch panel: {} not found; using the SDL window."
+                         .format(TOUCH_PANEL))
+
         try:
             proc = subprocess.Popen(
                 ["bash", str(run_sh)],
@@ -1160,13 +1215,72 @@ class App(tk.Tk):
             self._running[iid] = proc
             self.refresh()
             self.log("  PID {} launched.".format(proc.pid))
+            if panel:
+                panel["title"] = label
+                self._panels[iid] = panel
+                self._open_panel(iid)
             threading.Thread(
                 target=self._wait_exit,
                 args=(iid, proc, label),
                 daemon=True,
             ).start()
         except Exception as exc:
+            if panel:
+                shutil.rmtree(panel["dir"], ignore_errors=True)
             messagebox.showerror("Launch error", str(exc))
+
+    # ── Touch panel ───────────────────────────────────────────────────────────
+
+    def _panel_pref_changed(self) -> None:
+        try:
+            cfg = load_config()
+            cfg["touch_panel"] = bool(self._panel_var.get())
+            save_config(cfg)
+        except OSError:
+            pass
+        if self._running:
+            self.log("Touch panel setting applies the next time a device starts.")
+
+    def _open_panel(self, iid: str) -> None:
+        """Start the touch-panel window for a running device that has a QMP socket."""
+        info = self._panels.get(iid)
+        if not info:
+            return
+        old = info.get("proc")
+        if old is not None and old.poll() is None:
+            return                              # already open
+        try:
+            info["proc"] = spawn_touch_panel(info["sock"], info["title"])
+        except Exception as exc:
+            self.log("  touch panel failed to start: {}".format(exc))
+            return
+        self.log("  touch panel opened (PID {}).".format(info["proc"].pid))
+        threading.Thread(target=self._panel_exit,
+                         args=(info["proc"],), daemon=True).start()
+
+    def _panel_exit(self, proc: subprocess.Popen) -> None:
+        err = proc.stderr.read() if proc.stderr else ""
+        proc.wait()
+        if proc.returncode not in (0, None) and err.strip():
+            self.after(0, lambda: self.log(
+                "touch panel exited ({}): {}".format(
+                    proc.returncode, err.strip().splitlines()[-1])))
+
+    def _reopen_panel(self) -> None:
+        iid = self._sel_iid()
+        if not iid or iid not in self._running:
+            messagebox.showinfo(
+                "Touch panel",
+                "Select a running device that was started with the touch panel "
+                "enabled.")
+            return
+        if iid not in self._panels:
+            messagebox.showinfo(
+                "Touch panel",
+                "This device was started without the touch panel (it uses the "
+                "SDL window).\nTick \"Touch panel\" and start it again.")
+            return
+        self._open_panel(iid)
 
     def _wait_exit(
         self, iid: str, proc: subprocess.Popen, label: str
@@ -1178,6 +1292,12 @@ class App(tk.Tk):
             pass
         proc.wait()
         self._running.pop(iid, None)
+        panel = self._panels.pop(iid, None)
+        if panel:
+            pp = panel.get("proc")
+            if pp is not None and pp.poll() is None:
+                pp.terminate()                  # QEMU is gone; close its panel
+            shutil.rmtree(panel["dir"], ignore_errors=True)
         self.after(0, self.refresh)
         self.after(0, lambda: self.log(
             "{} exited (code {}).".format(label, proc.returncode)))
