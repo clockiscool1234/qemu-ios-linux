@@ -11,9 +11,19 @@ directory and the prefix can be changed from the Settings button (saved to
      copied into the device folder
   •  Start / stop QEMU for a device via its generated run.sh
   •  Delete device folders
+  •  firmwarekit's scratch (work) directory is created inside the device folder
+     (removed automatically when the create finishes); downloaded IPSWs go to your
+     Downloads folder, or the folder chosen in Settings / --downloads
+  •  Every build in firmware-catalog.json is offered per device (final releases,
+     developer / beta seeds, iOS 6 / 7 on the boards that can run them); builds the
+     catalog marks "coming soon" can be shown with a checkbox
+  •  Per-device preferences (name, verbose boot, boot-args, RAM, window scale and
+     rotation, extra QEMU arguments), saved in the same config file and applied
+     when the device is started
 
 Usage:
-    python3 tools/manageFirm.py [--base /opt] [--prefix DEV_] [--catalog path/to/firmware-catalog.json]
+    python3 tools/manageFirm.py [--base /opt] [--prefix DEV_] [--downloads ~/Downloads]
+                                [--catalog path/to/firmware-catalog.json]
 
 Environment:
     QEMU     Path to qemu-system-arm  (auto-detected from build/ or PATH if unset)
@@ -183,7 +193,9 @@ _TOOLS_DIR  = Path(__file__).resolve().parent        # tools/
 REPO_ROOT   = _TOOLS_DIR.parent
 FIRMWAREKIT = _TOOLS_DIR / "firmwarekit.py"
 TOUCH_PANEL = _TOOLS_DIR / "touchPanel.py"
-DEFAULT_CAT = REPO_ROOT / "iphone" / "firmware-catalog.json"
+DEFAULT_CAT = next((p for p in (_TOOLS_DIR / "firmware-catalog.json",
+                                REPO_ROOT / "iphone" / "firmware-catalog.json")
+                    if p.is_file()), _TOOLS_DIR / "firmware-catalog.json")
 IPSW_ME_API = "https://api.ipsw.me/v4/ipsw/{product}/{build}"
 _UA         = "qemu-ios-manageFirm/1.0"
 
@@ -191,6 +203,291 @@ DEFAULT_BASE   = "/opt"
 DEFAULT_PREFIX = "DEV_"
 CONFIG_PATH    = (Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
                   / "qemu-ios" / "manageFirm.json")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardware hints and firmware-catalog merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Real-hardware RAM (MB) and native screen (px).  The guest framebuffer is fixed by the
+# emulated hardware, so the "screen" preference scales the *window*, not the guest.
+_HW = {
+    "m68ap": (128, (320, 480)),
+    "n45ap": (128, (320, 480)),
+    "n72ap": (128, (320, 480)),
+    "n18ap": (256, (320, 480)),
+    "n88ap": (256, (320, 480)),
+    "k48ap": (256, (1024, 768)),
+    "n81ap": (256, (640, 960)),
+    "n90ap": (512, (640, 960)),
+}
+for _b, (_ram, _scr) in _HW.items():
+    DEVICES[_b]["ram_mb"] = _ram
+    DEVICES[_b]["screen"] = _scr
+
+_BASE_BUILDS = {b: dict(d["builds"]) for b, d in DEVICES.items()}
+CATALOG_ENTRIES: dict = {}          # (board, build) -> catalog entry
+
+
+def apply_catalog(path) -> int:
+    """Merge firmware-catalog.json into DEVICES[*]["builds"].
+
+    Every catalog entry for a known board becomes a selectable build (final releases,
+    developer / beta seeds, iOS 6 / 7 where the board supports them); the built-in list
+    is kept for builds the catalog lacks.  Returns the number of entries merged (0 if
+    the catalog is missing or unreadable, in which case the built-in list is used).
+    """
+    CATALOG_ENTRIES.clear()
+    for board, dev in DEVICES.items():
+        dev["builds"] = dict(_BASE_BUILDS[board])
+    try:
+        data = json.loads(Path(path).read_text())
+        entries = data.get("entries", [])
+    except Exception:
+        return 0
+    per: dict = {}
+    for e in entries:
+        board = e.get("board")
+        if board in DEVICES and e.get("build") and e.get("version"):
+            per.setdefault(board, []).append(e)
+    for board, ents in per.items():
+        builds = {}
+        for e in ents:
+            builds[e["build"]] = e["version"]
+            CATALOG_ENTRIES[(board, e["build"])] = e
+        for b, v in _BASE_BUILDS[board].items():
+            builds.setdefault(b, v)
+        DEVICES[board]["builds"] = builds
+    return len(CATALOG_ENTRIES)
+
+
+def build_info(board: str, build: str) -> dict:
+    """The catalog entry for a build ({} when the build is only in the built-in list)."""
+    return CATALOG_ENTRIES.get((board, build), {})
+
+
+def is_prerelease(board: str, build: str) -> bool:
+    return bool(build_info(board, build).get("prerelease"))
+
+
+def build_label(board: str, build: str, version: str) -> str:
+    """'8C5091e  (iOS 4.2)  [beta 1, experimental]' for the build drop-down."""
+    info = build_info(board, build)
+    tags = []
+    if info.get("prerelease"):
+        n = info.get("prerelease_number")
+        tags.append("{}{}".format(info["prerelease"], " {}".format(n) if n else ""))
+    st = info.get("status")
+    if st and st != "available":
+        tags.append(st.replace("_", " "))
+    return "{}  (iOS {}){}".format(
+        build, version, "  [" + ", ".join(tags) + "]" if tags else "")
+
+
+def list_builds(board: str, include_beta: bool = True,
+                include_unsupported: bool = False) -> list:
+    """Build ids for a board, filtered; catalog order (oldest first)."""
+    out = []
+    for build in DEVICES[board]["builds"]:
+        info = build_info(board, build)
+        if not include_beta and info.get("prerelease"):
+            continue
+        if not include_unsupported and info.get("status") == "coming_soon":
+            continue
+        out.append(build)
+    return out
+
+
+def catalog_sources(board: str, build: str) -> list:
+    """Download candidates for a build from the catalog: the primary source, then mirrors.
+
+    Each item: {"url", "kind" ("ipsw" | "rar"), "member", "sha1"}.  For kind "rar" the URL is
+    an archive and "member" is the IPSW inside it.
+    """
+    src = build_info(board, build).get("source") or {}
+    out = []
+    if src.get("url"):
+        out.append({"url": src["url"], "kind": src.get("kind", "ipsw"),
+                    "member": src.get("member"), "sha1": src.get("sha1")})
+    for m in src.get("mirrors", []) or []:
+        if m.get("url"):
+            out.append({"url": m["url"], "kind": "ipsw", "member": None,
+                        "sha1": m.get("sha1") or src.get("sha1")})
+    return out
+
+
+def default_download_dir() -> Path:
+    """The user's Downloads folder (XDG user-dirs.dirs), else ~/Downloads."""
+    cfg_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    try:
+        for line in (cfg_home / "user-dirs.dirs").read_text().splitlines():
+            m = re.match(r'\s*XDG_DOWNLOAD_DIR\s*=\s*"(.*)"\s*$', line)
+            if m:
+                p = Path(m.group(1).replace("$HOME", str(Path.home())))
+                if p != Path.home():        # "$HOME/" means "no Downloads folder"
+                    return p
+    except OSError:
+        pass
+    return Path.home() / "Downloads"
+
+
+def sha1_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    with open(str(path), "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def extract_rar_member(archive: Path, member: str, dest: Path) -> None:
+    """Pull one file out of a .rar with whichever of 7z / 7zz / unrar / bsdtar is installed."""
+    tmp = Path(tempfile.mkdtemp(prefix="qemu-ios-rar-", dir=str(dest.parent)))
+    try:
+        tried = []
+        for tool, cmd in (
+            ("7z",     ["7z", "e", "-y", "-o" + str(tmp), str(archive), member]),
+            ("7zz",    ["7zz", "e", "-y", "-o" + str(tmp), str(archive), member]),
+            ("unrar",  ["unrar", "e", "-o+", str(archive), member, str(tmp) + "/"]),
+            ("bsdtar", ["bsdtar", "-xf", str(archive), "-C", str(tmp), member]),
+        ):
+            if not shutil.which(tool):
+                continue
+            tried.append(tool)
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, errors="replace")
+            hits = list(tmp.rglob(Path(member).name))
+            if r.returncode == 0 and hits:
+                os.replace(str(hits[0]), str(dest))
+                return
+        if not tried:
+            raise RuntimeError("this build is shipped as a .rar; install 7z (p7zip-full), "
+                               "unrar or bsdtar to unpack it")
+        raise RuntimeError("could not extract {} from {} ({})".format(
+            member, archive.name, ", ".join(tried)))
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-device preferences
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_PREFS = {
+    "name":       "",       # display name (device list, window title)
+    "verbose":    False,    # iOS verbose boot ("-v" in the kernel command line)
+    "boot_args":  "",       # extra kernel boot-args (replaces iBoot's command line!)
+    "ram_mb":     0,        # 0 = the machine's own RAM size; else QEMU -m <n>M
+    "scale":      "fit",    # touch-panel window scale: "fit" or a factor
+    "rotate":     0,        # touch-panel rotation: 0 / 90 / 180 / 270
+    "extra_args": "",       # raw extra QEMU arguments
+}
+SCALE_CHOICES  = ["fit", "0.5", "0.75", "1", "1.5", "2"]
+RAM_CHOICES    = ["Default", "64", "128", "256", "512", "1024"]
+ROTATE_CHOICES = ["0", "90", "180", "270"]
+
+
+def get_prefs(dirname: str, cfg: Optional[dict] = None) -> dict:
+    """Saved preferences for a device folder name, filled in with defaults."""
+    cfg = load_config() if cfg is None else cfg
+    saved = (cfg.get("device_prefs") or {}).get(dirname) or {}
+    prefs = dict(DEFAULT_PREFS)
+    prefs.update({k: v for k, v in saved.items() if k in DEFAULT_PREFS})
+    return prefs
+
+
+def save_prefs(dirname: str, prefs: dict) -> None:
+    """Persist only the non-default values (an all-default device has no entry)."""
+    cfg = load_config()
+    dp = cfg.get("device_prefs")
+    dp = dp if isinstance(dp, dict) else {}
+    changed = {k: v for k, v in prefs.items()
+               if k in DEFAULT_PREFS and v != DEFAULT_PREFS[k]}
+    if changed:
+        dp[dirname] = changed
+    else:
+        dp.pop(dirname, None)
+    cfg["device_prefs"] = dp
+    save_config(cfg)
+
+
+def validate_prefs(prefs: dict) -> list:
+    """Problems with a preferences dict, as human-readable strings ([] when fine)."""
+    errs = []
+    ram = prefs.get("ram_mb", 0)
+    if not isinstance(ram, int) or not (ram == 0 or 16 <= ram <= 8192):
+        errs.append("RAM must be Default or between 16 and 8192 MB.")
+    sc = prefs.get("scale", "fit")
+    if sc != "fit":
+        try:
+            if not 0.05 <= float(sc) <= 8:
+                raise ValueError
+        except (TypeError, ValueError):
+            errs.append("Window scale must be 'fit' or a number between 0.05 and 8.")
+    if prefs.get("rotate", 0) not in (0, 90, 180, 270):
+        errs.append("Rotation must be 0, 90, 180 or 270.")
+    ba = prefs.get("boot_args", "")
+    if "\n" in ba or len(ba.encode()) + ba.count("%") > 250:
+        errs.append("Boot-args must be one line of at most ~250 bytes (each % counts twice).")
+    try:
+        shlex.split(prefs.get("extra_args", ""))
+    except ValueError as exc:
+        errs.append("Extra QEMU arguments: {}".format(exc))
+    return errs
+
+
+_PROP_CACHE: dict = {}
+
+
+def machine_has_property(qemu: str, machine: str, prop: str) -> bool:
+    """True if `qemu -M <machine>,help` lists the property (cached per binary + machine)."""
+    key = (qemu, machine)
+    if key not in _PROP_CACHE:
+        try:
+            r = subprocess.run([qemu, "-M", machine + ",help"], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, errors="replace",
+                               timeout=15)
+            _PROP_CACHE[key] = r.stdout
+        except Exception:
+            _PROP_CACHE[key] = ""
+    return re.search(r"(^|\s)" + re.escape(prop) + r"=", _PROP_CACHE[key]) is not None
+
+
+def build_pref_args(qemu: str, board: str, prefs: dict) -> tuple:
+    """QEMU arguments for a device's preferences -> (args, notes).
+
+    The arguments are appended after run.sh's own (QEMU merges repeated -M options), so
+    run.sh itself is never rewritten.  `notes` are warnings for the log (settings that
+    could not be applied).  Panel-only settings (scale, rotate) are handled elsewhere.
+    """
+    machine = DEVICES.get(board, {}).get("qemu_machine")
+    args, notes = [], []
+    if prefs.get("name"):
+        args += ["-name", prefs["name"].replace(",", ",,")]
+    if prefs.get("ram_mb"):
+        args += ["-m", "{}M".format(int(prefs["ram_mb"]))]
+    parts = (["-v"] if prefs.get("verbose") else []) + (
+        [prefs["boot_args"].strip()] if prefs.get("boot_args", "").strip() else [])
+    if parts and machine:
+        if machine_has_property(qemu, machine, "boot-args"):
+            args += ["-M", "{},boot-args={}".format(
+                machine, " ".join(parts).replace(",", ",,"))]
+        else:
+            notes.append("machine {} has no boot-args property in this QEMU build; "
+                         "verbose / boot-args ignored.".format(machine))
+    if prefs.get("extra_args", "").strip():
+        args += shlex.split(prefs["extra_args"])
+    return args, notes
+
+
+def write_args_wrapper(real_qemu: str, extra: list) -> dict:
+    """A one-line sh wrapper that runs `real_qemu "$@" <extra>`; run.sh uses it as $QEMU."""
+    tmp = tempfile.mkdtemp(prefix="qemu-ios-args-")
+    w = Path(tmp) / "qemu-args.sh"
+    w.write_text("#!/bin/sh\nexec {} \"$@\" {}\n".format(
+        shlex.quote(real_qemu), " ".join(shlex.quote(a) for a in extra)))
+    w.chmod(0o755)
+    return {"dir": tmp, "path": str(w)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,12 +663,18 @@ def scan_devices(base: Path, prefix: str = DEFAULT_PREFIX) -> list:
                 identity = json.loads(id_path.read_text())
             except Exception:
                 pass
+        info = build_info(board, build)
+        ver  = dev.get("builds", {}).get(build, build)
+        if info.get("prerelease"):
+            ver += " " + str(info["prerelease"])
         out.append({
             "path":        entry,
+            "dirname":     entry.name,
             "board":       board,
             "build":       build,
             "device_name": dev.get("name", board),
-            "ios_version": dev.get("builds", {}).get(build, build),
+            "ios_version": ver,
+            "status":      info.get("status", ""),
             "has_run_sh":  (entry / "run.sh").exists(),
             "identity":    identity,
         })
@@ -403,10 +706,16 @@ def prepare_touch_panel(env: dict, qemu: str) -> Optional[dict]:
     return {"dir": tmp, "sock": sock}
 
 
-def spawn_touch_panel(sock: str, title: str) -> subprocess.Popen:
+def spawn_touch_panel(sock: str, title: str, scale: str = "fit",
+                      rotate: int = 0) -> subprocess.Popen:
     """Open the touch panel window for the QEMU listening on QMP socket `sock`."""
+    cmd = [sys.executable, str(TOUCH_PANEL), "--qmp", sock, "--title", title]
+    if scale and scale != "fit":
+        cmd += ["--scale", str(scale)]
+    if rotate:
+        cmd += ["--rotate", str(int(rotate))]
     return subprocess.Popen(
-        [sys.executable, str(TOUCH_PANEL), "--qmp", sock, "--title", title],
+        cmd,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         errors="replace")
 
@@ -440,6 +749,7 @@ class CreateDeviceDialog(tk.Toplevel):
         prefix:   str,
         catalog:  Path,
         log_fn:   Callable,
+        download_dir: Optional[Path] = None,
     ) -> None:
         super().__init__(parent)
         self.title("New Virtual Device")
@@ -451,11 +761,14 @@ class CreateDeviceDialog(tk.Toplevel):
         self._prefix  = prefix
         self._catalog = catalog
         self._log     = log_fn
+        self._downloads = Path(download_dir) if download_dir else default_download_dir()
         self._proc    = None
         self._dl_proc = None      # aria2c, while downloading
         self._closed  = False
         self._board_keys = list(DEVICES.keys())
         self._build_keys = []
+        self._show_beta  = tk.BooleanVar(value=True)
+        self._show_unsup = tk.BooleanVar(value=False)
 
         self._build_widgets()
         self._refresh_board()
@@ -489,7 +802,20 @@ class CreateDeviceDialog(tk.Toplevel):
                                         state="readonly", width=42)
         self._build_cb.grid(row=row, column=1, columnspan=2, **P)
         self._build_cb.bind("<<ComboboxSelected>>",
-                            lambda _: self._refresh_out())
+                            lambda _: (self._refresh_out(), self._refresh_hint()))
+        row += 1
+
+        # Build filters + catalog note for the selected build
+        ff = ttk.Frame(f)
+        ff.grid(row=row, column=1, columnspan=2, **P)
+        ttk.Checkbutton(ff, text="Developer / beta builds", variable=self._show_beta,
+                        command=self._refresh_builds).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(ff, text="Coming soon (unsupported)", variable=self._show_unsup,
+                        command=self._refresh_builds).pack(side="left")
+        row += 1
+        self._build_hint = ttk.Label(f, text="", foreground="gray",
+                                      wraplength=420, justify="left")
+        self._build_hint.grid(row=row, column=1, columnspan=2, **P)
         row += 1
 
         # IPSW source radio
@@ -524,8 +850,10 @@ class CreateDeviceDialog(tk.Toplevel):
         # Catalog
         ttk.Label(f, text="Catalog JSON:").grid(row=row, column=0, **P)
         self._cat_var = tk.StringVar(value=str(self._catalog))
-        ttk.Entry(f, textvariable=self._cat_var, width=36).grid(
-            row=row, column=1, **P)
+        cat_entry = ttk.Entry(f, textvariable=self._cat_var, width=36)
+        cat_entry.grid(row=row, column=1, **P)
+        cat_entry.bind("<FocusOut>", lambda _: self._reload_catalog())
+        cat_entry.bind("<Return>",   lambda _: self._reload_catalog())
         ttk.Button(f, text="Browse…", command=self._browse_cat).grid(
             row=row, column=2, **P)
         row += 1
@@ -579,15 +907,47 @@ class CreateDeviceDialog(tk.Toplevel):
         i = self._build_cb.current()
         return self._build_keys[i] if (i >= 0 and self._build_keys) else ""
 
+    def _refresh_builds(self, keep: bool = True) -> None:
+        """Fill the build drop-down for the current board and filters."""
+        board = self._cur_board()
+        dev   = DEVICES[board]
+        prev  = self._cur_build() if keep else ""
+        self._build_keys = list_builds(board, self._show_beta.get(),
+                                       self._show_unsup.get())
+        self._build_cb["values"] = [
+            build_label(board, b, dev["builds"][b]) for b in self._build_keys]
+        if self._build_keys:
+            self._build_cb.current(
+                self._build_keys.index(prev) if prev in self._build_keys else 0)
+        else:
+            self._build_cb.set("")
+        self._refresh_out()
+        self._refresh_hint()
+
+    def _refresh_hint(self) -> None:
+        board, build = self._cur_board(), self._cur_build()
+        info = build_info(board, build)
+        bits = []
+        if info.get("released"):
+            bits.append("released " + info["released"])
+        if info.get("status"):
+            bits.append(info["status"].replace("_", " "))
+        text = ", ".join(bits)
+        if info.get("status_note"):
+            text += ("\n" if text else "") + info["status_note"]
+        self._build_hint.configure(text=text)
+
+    def _reload_catalog(self) -> None:
+        cat = self._cat_var.get().strip()
+        if cat and Path(cat).is_file():
+            n = apply_catalog(cat)
+            self._log("Catalog {}: {} builds.".format(cat, n))
+            self._refresh_builds()
+
     def _refresh_board(self) -> None:
         board = self._cur_board()
         dev   = DEVICES[board]
-        self._build_keys = list(dev["builds"].keys())
-        self._build_cb["values"] = [
-            "{}  (iOS {})".format(b, v) for b, v in dev["builds"].items()
-        ]
-        if self._build_keys:
-            self._build_cb.current(0)
+        self._refresh_builds(keep=False)
 
         needs_br = dev.get("needs_bootrom", False)
         br_state = "normal" if needs_br else "disabled"
@@ -613,6 +973,7 @@ class CreateDeviceDialog(tk.Toplevel):
     def _browse_ipsw(self) -> None:
         p = filedialog.askopenfilename(
             parent=self, title="Select IPSW",
+            initialdir=str(self._downloads) if self._downloads.is_dir() else None,
             filetypes=[("IPSW files", "*.ipsw"), ("All files", "*.*")])
         if p:
             self._ipsw_var.set(p)
@@ -628,6 +989,7 @@ class CreateDeviceDialog(tk.Toplevel):
             filetypes=[("JSON", "*.json"), ("All files", "*.*")])
         if p:
             self._cat_var.set(p)
+            self._reload_catalog()
 
     def _browse_bootrom(self) -> None:
         p = filedialog.askopenfilename(parent=self, title="Select bootrom file")
@@ -701,6 +1063,14 @@ class CreateDeviceDialog(tk.Toplevel):
                                        parent=self)
                 return
 
+        info = build_info(board, build)
+        if info.get("status") == "coming_soon" and not messagebox.askyesno(
+                "Not supported yet",
+                "{}\n\nThis build is marked \"coming soon\": it will probably not "
+                "boot.  Create it anyway?".format(info.get("status_note", "")),
+                parent=self):
+            return
+
         self._create_btn.configure(state="disabled")
 
         if self._ipsw_mode.get() == "browse":
@@ -728,52 +1098,95 @@ class CreateDeviceDialog(tk.Toplevel):
         product = dev["product"]
         version = dev["builds"][build]
         self._set_status(
-            "Fetching IPSW URL for {} {}…".format(product, version), busy=True)
-
-        dl_url = fetch_ipsw_download_url(product, build)
-        if not dl_url:
-            self._set_status(
-                "Could not find IPSW on ipsw.me.  Try browsing for the file.")
-            self._ui(lambda: self._create_btn.configure(state="normal"))
-            return
+            "Looking up IPSW for {} {}…".format(product, version), busy=True)
 
         fname = ipsw_filename(product, version, build)
-        dest  = Path("/tmp") / fname
+        dl_dir = self._downloads
+        dest   = dl_dir / fname
 
         if not dest.exists():
-            def _progress(done, total, note="") -> None:
-                if done is None:            # non-fatal problem (aria2c failed)
-                    self._log(note + " -- falling back to urllib")
-                    return
-                if total:
-                    pct = done * 100 / total
-                    msg = "Downloading {}…  {:.0f}%".format(fname, pct)
-                    if total != 100:        # urllib: byte counts
-                        msg += "  ({} / {} MiB)".format(
-                            done >> 20, total >> 20)
-                    if note:
-                        msg += "  " + note
-                    self._set_status(msg, pct=pct)
-                else:                       # size unknown
-                    self._set_status(
-                        "Downloading {}… {} MiB".format(fname, done >> 20),
-                        busy=True)
+            try:
+                dl_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._set_status("Cannot create download folder {}: {}".format(
+                    dl_dir, exc))
+                self._ui(lambda: self._create_btn.configure(state="normal"))
+                return
+            # Catalog sources first (they cover beta seeds and RAR-packed builds, with
+            # mirrors); ipsw.me last, for final releases only.
+            cands = catalog_sources(board, build)
+            if not is_prerelease(board, build):
+                api = fetch_ipsw_download_url(product, build)
+                if api and all(api != c["url"] for c in cands):
+                    cands.append({"url": api, "kind": "ipsw",
+                                  "member": None, "sha1": None})
+            if not cands:
+                self._set_status(
+                    "No download source for this build.  Try browsing for the file.")
+                self._ui(lambda: self._create_btn.configure(state="normal"))
+                return
 
             def _set_dl_proc(p) -> None:
                 self._dl_proc = p
 
-            tool = "aria2c -x16 -s16" if shutil.which("aria2c") else "urllib"
-            self._log("Downloading {} with {}".format(fname, tool))
-            self._set_status("Downloading {}…  0%".format(fname), pct=0)
-            try:
-                download_url_to_file(dl_url, dest, _progress,
-                                     should_stop=lambda: self._closed,
-                                     on_proc=_set_dl_proc)
-            except DownloadCancelled:
-                self._log("Download cancelled.")
-                return
-            except Exception as exc:
-                self._set_status("Download error: {}".format(exc))
+            ok = False
+            for cand in cands:
+                is_rar = cand["kind"] == "rar" and cand.get("member")
+                target = (dl_dir / "{}-{}.rar".format(board, build)
+                          if is_rar else dest)
+                label  = target.name
+
+                def _progress(done, total, note="", label=label) -> None:
+                    if done is None:        # non-fatal problem (aria2c failed)
+                        self._log(note + " -- falling back to urllib")
+                        return
+                    if total:
+                        pct = done * 100 / total
+                        msg = "Downloading {}…  {:.0f}%".format(label, pct)
+                        if total != 100:    # urllib: byte counts
+                            msg += "  ({} / {} MiB)".format(
+                                done >> 20, total >> 20)
+                        if note:
+                            msg += "  " + note
+                        self._set_status(msg, pct=pct)
+                    else:                   # size unknown
+                        self._set_status(
+                            "Downloading {}… {} MiB".format(label, done >> 20),
+                            busy=True)
+
+                tool = "aria2c -x16 -s16" if shutil.which("aria2c") else "urllib"
+                self._log("Downloading {} with {}  ({})".format(
+                    label, tool, cand["url"]))
+                self._set_status("Downloading {}…  0%".format(label), pct=0)
+                try:
+                    download_url_to_file(cand["url"], target, _progress,
+                                         should_stop=lambda: self._closed,
+                                         on_proc=_set_dl_proc)
+                    if is_rar:
+                        self._set_status("Unpacking {}…".format(cand["member"]),
+                                         busy=True)
+                        extract_rar_member(target, cand["member"], dest)
+                        target.unlink()
+                    if cand.get("sha1") and dest.exists():
+                        if sha1_file(dest) != cand["sha1"]:
+                            self._log("  WARNING: sha1 of {} does not match the "
+                                      "catalog.".format(fname))
+                    ok = dest.exists()
+                except DownloadCancelled:
+                    self._log("Download cancelled.")
+                    return
+                except Exception as exc:
+                    self._log("  source failed: {}".format(exc))
+                    for left in (target, dest):
+                        try:
+                            left.unlink()
+                        except OSError:
+                            pass
+                if ok:
+                    break
+            if not ok:
+                self._set_status("Download failed (see the log).  "
+                                 "Try browsing for the file.")
                 self._ui(lambda: self._create_btn.configure(state="normal"))
                 return
 
@@ -806,6 +1219,8 @@ class CreateDeviceDialog(tk.Toplevel):
             "--catalog", cat,
             "--id",      "{}-{}".format(board, build),
             "--out",     out,
+            # scratch space next to the device folder (firmwarekit removes it itself)
+            "--tmpdir",  str(Path(out).parent),
         ]
         seed    = self._seed_var.get().strip()
         bootrom = self._bootrom_var.get().strip()
@@ -873,7 +1288,7 @@ class SettingsDialog(tk.Toplevel):
     """Change where devices live and how their folders are named."""
 
     def __init__(self, parent, base_dir: Path, prefix: str,
-                 on_save: Callable) -> None:
+                 on_save: Callable, download_dir: Optional[Path] = None) -> None:
         super().__init__(parent)
         self.title("Settings")
         self.resizable(False, False)
@@ -906,8 +1321,22 @@ class SettingsDialog(tk.Toplevel):
                  "prefix or in another folder will not show up.",
         ).grid(row=3, column=0, columnspan=3, **P)
 
+        ttk.Label(f, text="IPSW downloads:").grid(row=4, column=0, **P)
+        self._dl_var = tk.StringVar(
+            value=str(download_dir or default_download_dir()))
+        ttk.Entry(f, textvariable=self._dl_var, width=44).grid(
+            row=4, column=1, **P)
+        ttk.Button(f, text="Browse…", command=self._browse_dl).grid(
+            row=4, column=2, **P)
+        ttk.Label(
+            f, foreground="gray", wraplength=480, justify="left",
+            text="Auto-downloaded IPSWs are saved here (default: your Downloads "
+                 "folder) and reused next time.  firmwarekit's scratch folder is "
+                 "created inside the device folder and deleted when it finishes.",
+        ).grid(row=5, column=0, columnspan=3, **P)
+
         bf = ttk.Frame(f)
-        bf.grid(row=4, column=0, columnspan=3, pady=8)
+        bf.grid(row=6, column=0, columnspan=3, pady=8)
         ttk.Button(bf, text="Save", command=self._save).pack(side="left", padx=6)
         ttk.Button(bf, text="Cancel", command=self.destroy).pack(
             side="left", padx=6)
@@ -930,6 +1359,15 @@ class SettingsDialog(tk.Toplevel):
         if p:
             self._base_var.set(p)
 
+    def _browse_dl(self) -> None:
+        cur = Path(os.path.expanduser(self._dl_var.get().strip() or "~"))
+        while not cur.is_dir() and cur != cur.parent:
+            cur = cur.parent
+        p = filedialog.askdirectory(parent=self, initialdir=str(cur),
+                                    title="Select IPSW download folder")
+        if p:
+            self._dl_var.set(p)
+
     def _save(self) -> None:
         raw    = self._base_var.get().strip()
         prefix = self._prefix_var.get().strip()
@@ -949,7 +1387,149 @@ class SettingsDialog(tk.Toplevel):
                 "The prefix must not be empty and must not contain spaces "
                 "or slashes.", parent=self)
             return
-        self._on_save(base, prefix)
+        dl_raw = self._dl_var.get().strip()
+        dl = Path(os.path.expanduser(dl_raw)) if dl_raw else default_download_dir()
+        if dl.exists() and not dl.is_dir():
+            messagebox.showwarning("Not a folder",
+                                   "{} is not a folder.".format(dl), parent=self)
+            return
+        self._on_save(base, prefix, dl)
+        self.destroy()
+
+
+class DevicePrefsDialog(tk.Toplevel):
+    """Per-device preferences: name, verbose boot, boot-args, RAM, window scale, ..."""
+
+    def __init__(self, parent, title: str, board: str, prefs: dict,
+                 boot_args_ok: bool, on_save: Callable) -> None:
+        super().__init__(parent)
+        self.title("Device Preferences")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self._on_save = on_save
+
+        dev = DEVICES.get(board, {})
+        P = {"padx": 8, "pady": 4, "sticky": "w"}
+        f = ttk.Frame(self, padding=10)
+        f.pack(fill="both", expand=True)
+        row = 0
+
+        ttk.Label(f, text=title, font=("", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, **P)
+        row += 1
+
+        self._pv_name = tk.StringVar(value=prefs["name"])
+        ttk.Label(f, text="Name:").grid(row=row, column=0, **P)
+        ttk.Entry(f, textvariable=self._pv_name, width=34).grid(
+            row=row, column=1, columnspan=2, **P)
+        row += 1
+        ttk.Label(f, text="Shown in the device list and used as the window title.",
+                  foreground="gray").grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+
+        self._pv_verbose = tk.BooleanVar(value=bool(prefs["verbose"]))
+        ttk.Checkbutton(f, text="Verbose boot (-v)", variable=self._pv_verbose).grid(
+            row=row, column=1, columnspan=2, **P)
+        row += 1
+
+        self._pv_boot_args = tk.StringVar(value=prefs["boot_args"])
+        ttk.Label(f, text="Boot-args:").grid(row=row, column=0, **P)
+        ttk.Entry(f, textvariable=self._pv_boot_args, width=34).grid(
+            row=row, column=1, columnspan=2, **P)
+        row += 1
+        ttk.Label(
+            f, foreground="gray", wraplength=380, justify="left",
+            text=("Replaces iBoot's whole kernel command line (it is not appended). "
+                  "Only machines with a boot-args property support this "
+                  "(checked when the device starts)."
+                  if boot_args_ok else
+                  "This board's machine model may not have a boot-args property; "
+                  "it is checked when the device starts and ignored if missing."),
+        ).grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+
+        ram = prefs["ram_mb"]
+        self._pv_ram = tk.StringVar(value="Default" if not ram else str(ram))
+        ttk.Label(f, text="RAM (MB):").grid(row=row, column=0, **P)
+        ttk.Combobox(f, textvariable=self._pv_ram, values=RAM_CHOICES, width=10).grid(
+            row=row, column=1, **P)
+        ttk.Label(f, foreground="gray",
+                  text="Real hardware: {} MB (QEMU -m)".format(
+                      dev.get("ram_mb", "?"))).grid(row=row, column=2, **P)
+        row += 1
+
+        w, h = dev.get("screen", (0, 0))
+        self._pv_scale = tk.StringVar(value=str(prefs["scale"]))
+        ttk.Label(f, text="Window scale:").grid(row=row, column=0, **P)
+        ttk.Combobox(f, textvariable=self._pv_scale, values=SCALE_CHOICES, width=10).grid(
+            row=row, column=1, **P)
+        ttk.Label(f, foreground="gray",
+                  text="Native screen: {}×{}".format(w, h)).grid(
+            row=row, column=2, **P)
+        row += 1
+
+        self._pv_rotate = tk.StringVar(value=str(prefs["rotate"]))
+        ttk.Label(f, text="Rotation:").grid(row=row, column=0, **P)
+        ttk.Combobox(f, textvariable=self._pv_rotate, values=ROTATE_CHOICES,
+                     width=10, state="readonly").grid(row=row, column=1, **P)
+        row += 1
+        ttk.Label(
+            f, foreground="gray", wraplength=380, justify="left",
+            text="The guest's screen resolution is fixed by the emulated hardware; "
+                 "scale and rotation apply to the touch-panel window (not the SDL "
+                 "window).").grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+
+        self._pv_extra = tk.StringVar(value=prefs["extra_args"])
+        ttk.Label(f, text="Extra QEMU args:").grid(row=row, column=0, **P)
+        ttk.Entry(f, textvariable=self._pv_extra, width=34).grid(
+            row=row, column=1, columnspan=2, **P)
+        row += 1
+
+        bf = ttk.Frame(f)
+        bf.grid(row=row, column=0, columnspan=3, pady=8)
+        ttk.Button(bf, text="Save", command=self._save).pack(side="left", padx=6)
+        ttk.Button(bf, text="Reset", command=self._reset).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+
+    def _reset(self) -> None:
+        d = DEFAULT_PREFS
+        self._pv_name.set(d["name"])
+        self._pv_verbose.set(d["verbose"])
+        self._pv_boot_args.set(d["boot_args"])
+        self._pv_ram.set("Default")
+        self._pv_scale.set(d["scale"])
+        self._pv_rotate.set(str(d["rotate"]))
+        self._pv_extra.set(d["extra_args"])
+
+    def _save(self) -> None:
+        ram_txt = self._pv_ram.get().strip()
+        try:
+            ram = 0 if ram_txt.lower() in ("", "default") else int(ram_txt)
+        except ValueError:
+            messagebox.showwarning("Invalid RAM", "RAM must be Default or a "
+                                   "number of MB.", parent=self)
+            return
+        try:
+            rotate = int(self._pv_rotate.get())
+        except ValueError:
+            rotate = -1
+        prefs = {
+            "name":       self._pv_name.get().strip(),
+            "verbose":    bool(self._pv_verbose.get()),
+            "boot_args":  self._pv_boot_args.get().strip(),
+            "ram_mb":     ram,
+            "scale":      self._pv_scale.get().strip() or "fit",
+            "rotate":     rotate,
+            "extra_args": self._pv_extra.get().strip(),
+        }
+        errs = validate_prefs(prefs)
+        if errs:
+            messagebox.showwarning("Invalid preferences", "\n".join(errs),
+                                   parent=self)
+            return
+        self._on_save(prefs)
         self.destroy()
 
 
@@ -960,7 +1540,8 @@ class SettingsDialog(tk.Toplevel):
 class App(tk.Tk):
 
     def __init__(self, base_dir: Path, catalog: Path,
-                 prefix: str = DEFAULT_PREFIX) -> None:
+                 prefix: str = DEFAULT_PREFIX,
+                 download_dir: Optional[Path] = None) -> None:
         super().__init__()
         self.title("QEMU-iOS Device Manager")
         self.geometry("980x650")
@@ -968,10 +1549,12 @@ class App(tk.Tk):
 
         self._base    = base_dir
         self._prefix  = prefix
+        self._download = Path(download_dir) if download_dir else default_download_dir()
         self._catalog = catalog
         self._devs: list    = []
         self._running: dict = {}   # path_str → subprocess.Popen
         self._panels: dict  = {}   # path_str → {"dir", "sock", "title", "proc"}
+        self._argdirs: dict = {}   # path_str → temp dir of the preferences wrapper
         self._panel_var = tk.BooleanVar(
             value=bool(load_config().get("touch_panel", True)))
 
@@ -1000,6 +1583,7 @@ class App(tk.Tk):
         tb_btn("▶  Start",     self._start_device)
         tb_btn("■  Stop",      self._stop_device)
         tb_btn("✕  Delete",    self._delete_device)
+        tb_btn("☰  Prefs",     self._edit_prefs)
         ttk.Separator(tb, orient="vertical").pack(
             side="left", fill="y", padx=6, pady=2)
         ttk.Checkbutton(
@@ -1025,7 +1609,7 @@ class App(tk.Tk):
         cols = ("Device", "Board", "iOS", "Status", "Path")
         self._tree = ttk.Treeview(lf, columns=cols, show="headings",
                                    selectmode="browse")
-        for col, width in zip(cols, (220, 90, 72, 84, 360)):
+        for col, width in zip(cols, (220, 90, 110, 84, 340)):
             self._tree.heading(col, text=col,
                                command=lambda c=col: self._sort_col(c))
             self._tree.column(col, width=width, minwidth=50, anchor="w")
@@ -1077,6 +1661,7 @@ class App(tk.Tk):
                 del self._running[k]
 
         self._devs = scan_devices(self._base, self._prefix)
+        saved = load_config()
         sel = self._sel_iid()
         self._tree.delete(*self._tree.get_children())
 
@@ -1088,9 +1673,10 @@ class App(tk.Tk):
                        else ("Ready" if has_run else "No run.sh"))
             tag     = ("running" if running
                        else ("stopped" if has_run else "missing"))
+            custom = get_prefs(d["dirname"], saved)["name"]
             self._tree.insert(
                 "", "end", iid=ps,
-                values=(d["device_name"], d["board"],
+                values=(custom or d["device_name"], d["board"],
                         d["ios_version"], status, ps),
                 tags=(tag,))
 
@@ -1118,28 +1704,34 @@ class App(tk.Tk):
             self._base, self._prefix))
 
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self, self._base, self._prefix, self._apply_settings)
+        dlg = SettingsDialog(self, self._base, self._prefix, self._apply_settings,
+                             self._download)
         self.wait_window(dlg)
 
-    def _apply_settings(self, base: Path, prefix: str) -> None:
+    def _apply_settings(self, base: Path, prefix: str,
+                        download: Optional[Path] = None) -> None:
         self._base, self._prefix = base, prefix
+        if download is not None:
+            self._download = download
         self._update_base_label()
         try:
             cfg = load_config()
-            cfg.update({"base": str(base), "prefix": prefix})
+            cfg.update({"base": str(base), "prefix": prefix,
+                        "download_dir": str(self._download)})
             save_config(cfg)
         except OSError as exc:
             messagebox.showwarning(
                 "Settings not saved",
                 "Applied for this session, but could not write {}:\n{}".format(
                     CONFIG_PATH, exc))
-        self.log("Device folder: {}   Prefix: {}".format(base, prefix))
+        self.log("Device folder: {}   Prefix: {}   IPSW downloads: {}".format(
+            base, prefix, self._download))
         self.refresh()
         self._on_select()
 
     def _new_device(self) -> None:
         dlg = CreateDeviceDialog(self, self._base, self._prefix,
-                                 self._catalog, self.log)
+                                 self._catalog, self.log, self._download)
         self.wait_window(dlg)
         self.refresh()
 
@@ -1191,7 +1783,10 @@ class App(tk.Tk):
             env["BOOTROM"] = bootrom
 
         run_sh = d["path"] / "run.sh"
+        prefs  = get_prefs(d["dirname"])
         label  = "{device_name}  [{board}-{build}]".format(**d)
+        if prefs["name"]:
+            label = "{}  [{}-{}]".format(prefs["name"], d["board"], d["build"])
         self.log("Starting {}  •  QEMU={}".format(label, qemu))
 
         # Touch panel: QMP socket + no SDL window (see prepare_touch_panel)
@@ -1201,6 +1796,23 @@ class App(tk.Tk):
             if panel is None:
                 self.log("  touch panel: {} not found; using the SDL window."
                          .format(TOUCH_PANEL))
+
+        # Preferences: extra QEMU arguments go through a wrapper that wraps whatever
+        # $QEMU is now (the real binary, or the touch-panel wrapper).
+        for msg in validate_prefs(prefs):
+            self.log("  preferences: {}".format(msg))
+        extra, notes = build_pref_args(qemu, d["board"], prefs)
+        for n in notes:
+            self.log("  preferences: {}".format(n))
+        if extra:
+            aw = write_args_wrapper(env["QEMU"], extra)
+            env["QEMU"] = aw["path"]
+            self._argdirs[iid] = aw["dir"]
+            self.log("  preferences: QEMU extra args: {}".format(
+                " ".join(shlex.quote(a) for a in extra)))
+        if not panel and (prefs["scale"] != "fit" or prefs["rotate"]):
+            self.log("  preferences: window scale / rotation only apply to the "
+                     "touch panel; it is off, so they are ignored.")
 
         try:
             proc = subprocess.Popen(
@@ -1217,6 +1829,8 @@ class App(tk.Tk):
             self.log("  PID {} launched.".format(proc.pid))
             if panel:
                 panel["title"] = label
+                panel["scale"] = prefs["scale"]
+                panel["rotate"] = prefs["rotate"]
                 self._panels[iid] = panel
                 self._open_panel(iid)
             threading.Thread(
@@ -1227,7 +1841,36 @@ class App(tk.Tk):
         except Exception as exc:
             if panel:
                 shutil.rmtree(panel["dir"], ignore_errors=True)
+            shutil.rmtree(self._argdirs.pop(iid, ""), ignore_errors=True)
             messagebox.showerror("Launch error", str(exc))
+
+    # ── Device preferences ────────────────────────────────────────────────────
+
+    def _edit_prefs(self) -> None:
+        iid = self._sel_iid()
+        d = self._dev_for(iid) if iid else None
+        if not d:
+            messagebox.showinfo("No selection", "Select a device first.")
+            return
+        prefs = get_prefs(d["dirname"])
+        title = "{}  [{}-{}]".format(d["device_name"], d["board"], d["build"])
+
+        def _saved(new: dict) -> None:
+            try:
+                save_prefs(d["dirname"], new)
+            except OSError as exc:
+                messagebox.showwarning(
+                    "Preferences not saved",
+                    "Could not write {}:\n{}".format(CONFIG_PATH, exc))
+                return
+            self.log("Preferences saved for {}.".format(d["dirname"]))
+            if iid in self._running:
+                self.log("They apply the next time this device starts.")
+            self.refresh()
+            self._on_select()
+
+        dlg = DevicePrefsDialog(self, title, d["board"], prefs, True, _saved)
+        self.wait_window(dlg)
 
     # ── Touch panel ───────────────────────────────────────────────────────────
 
@@ -1250,7 +1893,9 @@ class App(tk.Tk):
         if old is not None and old.poll() is None:
             return                              # already open
         try:
-            info["proc"] = spawn_touch_panel(info["sock"], info["title"])
+            info["proc"] = spawn_touch_panel(
+                info["sock"], info["title"],
+                info.get("scale", "fit"), info.get("rotate", 0))
         except Exception as exc:
             self.log("  touch panel failed to start: {}".format(exc))
             return
@@ -1292,6 +1937,7 @@ class App(tk.Tk):
             pass
         proc.wait()
         self._running.pop(iid, None)
+        shutil.rmtree(self._argdirs.pop(iid, ""), ignore_errors=True)
         panel = self._panels.pop(iid, None)
         if panel:
             pp = panel.get("proc")
@@ -1375,11 +2021,20 @@ class App(tk.Tk):
             proc    = self._running.get(iid)
             pid_str = ("Running  (PID {})".format(proc.pid)
                        if running and proc else "Stopped")
+            prefs = get_prefs(d["dirname"])
+            info  = build_info(d["board"], d["build"])
             lines = [
+                "Name         {}".format(prefs["name"] or "(none)"),
                 "Device       {}".format(d["device_name"]),
                 "Board ID     {}".format(d["board"]),
                 "Build        {}".format(d["build"]),
                 "iOS          {}".format(d["ios_version"]),
+                "Catalog      {}".format(
+                    (info.get("status", "?").replace("_", " ")
+                     + (", released " + info["released"] if info.get("released") else ""))
+                    if info else "not in catalog"),
+                "Screen       {}x{} native   RAM {} MB (hardware)".format(
+                    *dev.get("screen", ("?", "?")), dev.get("ram_mb", "?")),
                 "SoC          {}".format(dev.get("soc", "?")),
                 "QEMU -M      {}".format(dev.get("qemu_machine", "?")),
                 "Needs root   {}".format("Yes" if dev.get("needs_sudo") else "No"),
@@ -1391,6 +2046,12 @@ class App(tk.Tk):
                 "Status       {}".format(pid_str),
                 "Path         {}".format(d["path"]),
             ]
+            changed = {k: v for k, v in prefs.items()
+                       if k != "name" and v != DEFAULT_PREFS[k]}
+            if changed:
+                lines += ["", "── Preferences ───────────────────────────"]
+                for k, v in changed.items():
+                    lines.append("  {:<20} {}".format(k, v))
             if d["identity"]:
                 lines += ["", "── Identity ──────────────────────────────"]
                 for k, v in d["identity"].items():
@@ -1453,6 +2114,9 @@ Examples
     ap.add_argument("--prefix", default=None,
                     help="Device folder name prefix  (default: saved setting, "
                          "else {})".format(DEFAULT_PREFIX))
+    ap.add_argument("--downloads", default=None,
+                    help="Folder for auto-downloaded IPSWs  (default: saved setting, "
+                         "else your Downloads folder)")
     ap.add_argument("--catalog", default=str(DEFAULT_CAT),
                     help="Path to firmware-catalog.json  (default: {})".format(
                         DEFAULT_CAT))
@@ -1467,17 +2131,22 @@ Examples
             prefix, DEFAULT_PREFIX))
         prefix = DEFAULT_PREFIX
     catalog = Path(args.catalog)
+    n_builds = apply_catalog(catalog)
+    if n_builds:
+        print("[info] {} builds loaded from {}".format(n_builds, catalog))
 
     if not base.exists():
         print("[info] Base directory {!r} does not exist yet; "
               "it will be populated when the first device is created.".format(
                   str(base)))
     if not catalog.exists():
-        print("[warn] Catalog not found at {!r}; "
-              "you can browse for it in the Create Device dialog.".format(
-                  str(catalog)))
+        print("[warn] Catalog not found at {!r}; using the built-in build list "
+              "(browse for the catalog in the Create Device dialog to get every "
+              "build).".format(str(catalog)))
 
-    App(base, catalog, prefix).mainloop()
+    download = Path(os.path.expanduser(
+        args.downloads or cfg.get("download_dir") or str(default_download_dir())))
+    App(base, catalog, prefix, download).mainloop()
 
 
 if __name__ == "__main__":

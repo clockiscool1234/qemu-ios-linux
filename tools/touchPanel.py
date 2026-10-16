@@ -19,6 +19,18 @@ Usage (QEMU started with `-qmp unix:/tmp/dev.sock,server,nowait`; manageFirm.py 
 
 Closing the panel does not stop QEMU; buttons held at that moment are released.
 
+The "Phone..." button opens a second window that drives the fake cellular modem and the battery over QMP
+`qom-set` (no guest software involved, the guest just sees a baseband / PMU that changed):
+
+  * Call     fake incoming call from any number, then answer-from-the-far-end / hang up;
+  * SMS      fake incoming text message from any number;
+  * Network  carrier name + MCC-MNC, signal strength (dBm), "No service" (registered off), SIM removed;
+  * Battery  charge level 0-100 %, charging auto/on/off and the USB cable.
+
+The modem only exists where the machine has one: /machine/baseband-modem (an iPhone machine started with
+baseband=on, e.g. `-M iPhone-4,baseband=on`; the iPhone 2G has it by default).  Without it the Call / SMS /
+Network tabs are greyed out and say so; the Battery tab only needs the machine's battery-level property.
+
 Optional: Pillow (with ImageTk) gives smooth fit-to-window scaling and 90-degree view rotation (an iPad's
 landscape panel shows the portrait UI sideways).  Without it the screen is shown at 1:1, 1:2, 1:3 ... or 2:1.
 
@@ -164,6 +176,63 @@ def exec_qemu(argv):
         sys.exit("touchPanel: --exec-qemu needs LT_REAL_QEMU")
     args = build_qemu_args(argv, os.environ.get("LT_QMP_SOCK"), os.environ.get("LT_HIDE_DISPLAY") == "1")
     os.execv(real, [real] + args)
+
+
+# ---- phone controls (QOM paths and value rules mirror hw/misc/ios_baseband.c) ----------------------
+MACHINE_PATH = "/machine"
+MODEM_PATH = "/machine/baseband-modem"
+SIGNAL_MIN_DBM, SIGNAL_MAX_DBM = -113, -51
+SIGNAL_PRESETS = (("5 bars", -59), ("3 bars", -95), ("1 bar", -109))      # 5 and 3 bars verified on N90 4.2.1
+CARRIERS = (                                                                 # name, MCC+MNC (typical values)
+    ("Test Network", "00101"), ("AT&T", "310410"), ("T-Mobile", "310260"), ("Verizon", "311480"),
+    ("Vodafone UK", "23415"), ("Globe", "51502"), ("Smart", "51503"),
+)
+
+
+def valid_phone_number(n):
+    """The modem's sender rule: 1-20 digits, optionally after a leading '+'."""
+    digits = n[1:] if n.startswith("+") else n
+    return 1 <= len(digits) <= 20 and digits.isdigit() and len(n) <= 31
+
+
+def sms_value(number, text):
+    """The incoming-sms property's value, "<number>|<text>".  ValueError says what is wrong."""
+    number = number.strip()
+    if not valid_phone_number(number):
+        raise ValueError("number must be 1-20 digits, optionally starting with +")
+    if not text.strip():
+        raise ValueError("the message is empty")
+    return "%s|%s" % (number, text)
+
+
+def valid_plmn(s):
+    return s.isdigit() and len(s) in (5, 6)
+
+
+def valid_carrier(s):
+    return 1 <= len(s) <= 32 and s.isprintable() and '"' not in s
+
+
+def qom_set_args(path, prop, value):
+    return {"path": path, "property": prop, "value": value}
+
+
+def charging_args(machine_props, mode):
+    """(property, value) that sets 'auto' / 'on' / 'off' charging on this machine: the iPod and iPhone machines
+    have battery-charging (a string); the A4 machines only usb-charger (a bool, "off" takes a replug)."""
+    if "battery-charging" in machine_props:
+        return "battery-charging", mode
+    if "usb-charger" in machine_props:
+        return "usb-charger", mode != "off"
+    return None
+
+
+def phone_caps(machine_props):
+    """What this machine offers the Phone window, from the names qom-list shows under /machine."""
+    names = set(machine_props)
+    return {"modem": "baseband-modem" in names, "battery": "battery-level" in names,
+            "charging": charging_args(names, "auto") is not None, "usb": "usb-attached" in names,
+            "machine_props": names}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -332,6 +401,21 @@ class QMPClient:
     def input_events(self, events):
         self.send_nowait("input-send-event", {"events": events})
 
+    def qom_set(self, path, prop, value, timeout=5.0):
+        return self.execute("qom-set", qom_set_args(path, prop, value), timeout=timeout)
+
+    def qom_get(self, path, prop, timeout=5.0):
+        return self.execute("qom-get", {"path": path, "property": prop}, timeout=timeout)
+
+    def qom_names(self, path, timeout=5.0):
+        """Property and child names under a QOM path (empty when the path does not exist)."""
+        try:
+            return [e["name"] for e in self.execute("qom-list", {"path": path}, timeout=timeout) or []]
+        except QMPError as e:
+            if "not found" in str(e).lower():       # QEMU: "Device '...' not found" / "Property ... not found"
+                return []
+            raise
+
     def close(self):
         self.closed = True
         try:
@@ -445,6 +529,10 @@ def _gui_main(args, run=True):
             self._tid = 1
             self._fps_n, self._fps_t, self._fps = 0, time.monotonic(), 0.0
             self._closing = False
+            self._phone_win = None                   # the Phone... window (Toplevel) while open
+            self._phone = None                       # phone_caps() of this machine, once probed
+            self._phone_ui = {}
+            self._callstate_busy = False
             self.qmp = QMPClient(args.qmp, on_event=self._on_event, on_close=self._on_qmp_close,
                                  on_error=lambda c, t: self._status_q.put(("warn", "%s: %s" % (c, t))))
             self.grabber = None
@@ -502,6 +590,7 @@ def _gui_main(args, run=True):
             hw_button("Vol −", "voldown", "")
             ttk.Separator(side).pack(fill="x", pady=6)
             ttk.Button(side, text="Screenshot", width=8, command=self._screenshot).pack(fill="x", pady=3)
+            ttk.Button(side, text="Phone…", width=8, command=self._open_phone).pack(fill="x", pady=3)
             self._status = ttk.Label(self, text="", anchor="w", padding=(6, 2), foreground="#555555")
             self._status.pack(fill="x", side="bottom")
 
@@ -519,6 +608,9 @@ def _gui_main(args, run=True):
         def _set_status(self, text):
             self._status_text = text
             self._refresh_status()
+            note = self._phone_ui.get("note")
+            if note is not None and self._phone_win is not None:
+                note.configure(text=text)
 
         def _refresh_status(self):
             extra = ""
@@ -569,6 +661,12 @@ def _gui_main(args, run=True):
                     elif kind == "fatal":
                         self._set_status(text)
                         self.canvas.itemconfigure(self._msg_item, text=text)
+                    elif kind == "probe":
+                        self._apply_probe(text)           # `text` is the payload here
+                    elif kind == "callstate":
+                        lab = self._phone_ui.get("callstate")
+                        if lab is not None and self._phone_win is not None:
+                            lab.configure(text="Call state: %s" % text)
                     else:
                         self._set_status(text)
             except queue.Empty:
@@ -757,6 +855,305 @@ def _gui_main(args, run=True):
             except QMPError as ex:
                 self._set_status("Not sent: %s" % ex)
 
+        # -- phone window: fake call / SMS, carrier, battery ---------------------
+        def _qom_async(self, path, prop, value, ok=None):
+            """qom-set on a worker thread; the outcome goes to the status line."""
+            def work():
+                try:
+                    self.qmp.qom_set(path, prop, value)
+                    self._status_q.put(("info", ok or "%s set" % prop))
+                except QMPError as ex:
+                    self._status_q.put(("warn", "%s: %s" % (prop, ex)))
+            threading.Thread(target=work, daemon=True).start()
+
+        def _modem(self, prop, value, ok=None):
+            self._qom_async(MODEM_PATH, prop, value, ok)
+
+        def _machine(self, prop, value, ok=None):
+            self._qom_async(MACHINE_PATH, prop, value, ok)
+
+        def _open_phone(self):
+            if self._phone_win is not None:
+                self._phone_win.lift()
+                return
+            if not self._connected:
+                self._set_status("Phone: not connected to QEMU yet")
+                return
+            win = tk.Toplevel(self)
+            self._phone_win = win
+            win.title("Phone controls")
+            win.resizable(False, False)
+            win.protocol("WM_DELETE_WINDOW", self._close_phone)
+            ui = self._phone_ui = {}
+            self._modem_widgets, self._battery_widgets = [], []
+
+            def widget(kind, parent, group, **kw):
+                w = kind(parent, **kw)
+                group.append(w)
+                return w
+
+            nb = ttk.Notebook(win)
+            nb.pack(fill="both", expand=True, padx=6, pady=6)
+            tabs = {}
+            for name in ("Call", "SMS", "Network", "Battery"):
+                f = ttk.Frame(nb, padding=10)
+                nb.add(f, text=name)
+                tabs[name] = f
+            ui["nb"] = nb
+            ui["nomodem"] = ttk.Label(
+                win, wraplength=330, foreground="#a33", justify="left",
+                text="This machine has no baseband (the Call, SMS and Network tabs need one). Start an iPhone "
+                     "machine with baseband=on, e.g. -M iPhone-4,baseband=on.")
+
+            # Call
+            f = tabs["Call"]
+            ui["call_num"] = tk.StringVar(value="+15551234567")
+            ttk.Label(f, text="From number").grid(row=0, column=0, sticky="w")
+            widget(ttk.Entry, f, self._modem_widgets, textvariable=ui["call_num"], width=24).grid(
+                row=0, column=1, columnspan=2, sticky="we", pady=2)
+            widget(ttk.Button, f, self._modem_widgets, text="Ring (incoming call)", command=self._do_call).grid(
+                row=1, column=0, columnspan=3, sticky="we", pady=(8, 2))
+            widget(ttk.Button, f, self._modem_widgets, text="Caller answers (outgoing call)",
+                   command=lambda: self._modem("remote-answer", "1", "Far end answered")).grid(
+                row=2, column=0, columnspan=3, sticky="we", pady=2)
+            widget(ttk.Button, f, self._modem_widgets, text="Caller hangs up",
+                   command=lambda: self._modem("remote-hangup", "1", "Far end hung up")).grid(
+                row=3, column=0, columnspan=3, sticky="we", pady=2)
+            ui["callstate"] = ttk.Label(f, text="Call state: -", foreground="#555555")
+            ui["callstate"].grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            ttk.Label(f, text="To take the call on the guest, tap Accept on its screen.", foreground="#555555",
+                      wraplength=320).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+            # SMS
+            f = tabs["SMS"]
+            ui["sms_num"] = tk.StringVar(value="+15551234567")
+            ttk.Label(f, text="From number").grid(row=0, column=0, sticky="w")
+            widget(ttk.Entry, f, self._modem_widgets, textvariable=ui["sms_num"], width=26).grid(
+                row=0, column=1, sticky="we", pady=2)
+            ttk.Label(f, text="Message").grid(row=1, column=0, sticky="nw", pady=(6, 0))
+            ui["sms_text"] = widget(tk.Text, f, self._modem_widgets, width=30, height=5, wrap="word")
+            ui["sms_text"].grid(row=1, column=1, sticky="we", pady=(6, 2))
+            ui["sms_text"].insert("1.0", "Hello from the host!")
+            widget(ttk.Button, f, self._modem_widgets, text="Receive SMS", command=self._do_sms).grid(
+                row=2, column=0, columnspan=2, sticky="we", pady=(8, 0))
+
+            # Network
+            f = tabs["Network"]
+            ui["carrier"] = tk.StringVar(value=CARRIERS[0][0])
+            ui["plmn"] = tk.StringVar(value=CARRIERS[0][1])
+            ttk.Label(f, text="Carrier").grid(row=0, column=0, sticky="w")
+            cb = widget(ttk.Combobox, f, self._modem_widgets, textvariable=ui["carrier"], width=22,
+                        values=[c[0] for c in CARRIERS])
+            cb.grid(row=0, column=1, sticky="we", pady=2)
+            cb.bind("<<ComboboxSelected>>", self._carrier_picked)
+            ttk.Label(f, text="MCC-MNC").grid(row=1, column=0, sticky="w")
+            widget(ttk.Entry, f, self._modem_widgets, textvariable=ui["plmn"], width=10).grid(
+                row=1, column=1, sticky="w", pady=2)
+            widget(ttk.Button, f, self._modem_widgets, text="Apply carrier", command=self._do_carrier).grid(
+                row=2, column=0, columnspan=2, sticky="we", pady=(4, 8))
+            ttk.Separator(f).grid(row=3, column=0, columnspan=2, sticky="we", pady=4)
+            ui["dbm"] = tk.IntVar(value=-59)
+            ui["dbm_label"] = ttk.Label(f, text="Signal: -59 dBm")
+            ui["dbm_label"].grid(row=4, column=0, columnspan=2, sticky="w")
+            sc = widget(ttk.Scale, f, self._modem_widgets, from_=SIGNAL_MIN_DBM, to=SIGNAL_MAX_DBM,
+                        orient="horizontal", length=260,
+                        command=lambda v: ui["dbm_label"].configure(text="Signal: %d dBm" % round(float(v))))
+            sc.grid(row=5, column=0, columnspan=2, sticky="we")
+            sc.set(-59)
+            sc.bind("<ButtonRelease-1>", lambda e: self._modem("signal-dbm", round(float(sc.get())),
+                                                               "Signal %d dBm" % round(float(sc.get()))))
+            ui["dbm_scale"] = sc
+            pr = ttk.Frame(f)
+            pr.grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
+            for label, dbm in SIGNAL_PRESETS:
+                widget(ttk.Button, pr, self._modem_widgets, text=label, width=7,
+                       command=lambda d=dbm: self._set_signal(d)).pack(side="left", padx=(0, 4))
+            ui["registered"] = tk.BooleanVar(value=False)       # True = "No service"
+            ui["nosim"] = tk.BooleanVar(value=False)
+            widget(ttk.Checkbutton, f, self._modem_widgets, text="No service (deregister)",
+                   variable=ui["registered"], command=lambda: self._modem(
+                       "registered", not ui["registered"].get(),
+                       "No service" if ui["registered"].get() else "Registered again")).grid(
+                row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            widget(ttk.Checkbutton, f, self._modem_widgets, text="No SIM card", variable=ui["nosim"],
+                   command=lambda: self._modem("sim-present", not ui["nosim"].get(),
+                                               "SIM removed" if ui["nosim"].get() else "SIM inserted")).grid(
+                row=8, column=0, columnspan=2, sticky="w")
+
+            # Battery
+            f = tabs["Battery"]
+            ui["batt_label"] = ttk.Label(f, text="Level: 100 %")
+            ui["batt_label"].grid(row=0, column=0, columnspan=4, sticky="w")
+            bs = widget(ttk.Scale, f, self._battery_widgets, from_=0, to=100, orient="horizontal", length=260,
+                        command=lambda v: ui["batt_label"].configure(text="Level: %d %%" % round(float(v))))
+            bs.grid(row=1, column=0, columnspan=4, sticky="we")
+            bs.set(100)
+            bs.bind("<ButtonRelease-1>", lambda e: self._set_battery(round(float(bs.get()))))
+            ui["batt_scale"] = bs
+            for i, pct in enumerate((100, 50, 20, 5)):
+                widget(ttk.Button, f, self._battery_widgets, text="%d%%" % pct, width=5,
+                       command=lambda v=pct: self._set_battery(v)).grid(row=2, column=i, pady=4, padx=(0, 4))
+            ui["charging"] = tk.StringVar(value="auto")
+            ttk.Label(f, text="Charging").grid(row=3, column=0, sticky="w", pady=(8, 0))
+            cf = ttk.Frame(f)
+            cf.grid(row=4, column=0, columnspan=4, sticky="w")
+            ui["charging_buttons"] = []
+            for label, val in (("Auto", "auto"), ("Charging", "on"), ("Not charging", "off")):
+                rb = ttk.Radiobutton(cf, text=label, value=val, variable=ui["charging"],
+                                     command=self._do_charging)
+                rb.pack(side="left", padx=(0, 8))
+                ui["charging_buttons"].append(rb)
+            ui["usb"] = tk.BooleanVar(value=True)
+            ui["usb_check"] = ttk.Checkbutton(
+                f, text="USB cable plugged in", variable=ui["usb"],
+                command=lambda: self._machine("usb-attached", ui["usb"].get(),
+                                              "USB cable in" if ui["usb"].get() else "USB cable out"))
+            ui["usb_check"].grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+            ui["note"] = ttk.Label(win, text=self._status_text, anchor="w", foreground="#555555", padding=(8, 2))
+            ui["note"].pack(fill="x", side="bottom")
+            self._set_group_state(self._modem_widgets, False)
+            self._set_group_state(self._battery_widgets, False)
+            threading.Thread(target=self._probe_phone, daemon=True).start()
+            self.after(2000, self._poll_callstate)
+
+        def _close_phone(self):
+            win, self._phone_win = self._phone_win, None
+            self._phone_ui = {}
+            if win is not None:
+                win.destroy()
+
+        @staticmethod
+        def _set_group_state(group, enabled):
+            for w in group:
+                try:
+                    w.state(["!disabled"] if enabled else ["disabled"])
+                except (AttributeError, tk.TclError):
+                    w.configure(state="normal" if enabled else "disabled")
+
+        def _probe_phone(self):
+            """Worker thread: which phone controls does this machine have, and what are the current values?"""
+            try:
+                caps = phone_caps(self.qmp.qom_names(MACHINE_PATH))
+                caps["values"] = {}
+                for prop, path in (("battery-level", MACHINE_PATH), ("usb-attached", MACHINE_PATH),
+                                   ("signal-dbm", MODEM_PATH), ("carrier", MODEM_PATH),
+                                   ("mcc-mnc", MODEM_PATH), ("registered", MODEM_PATH),
+                                   ("sim-present", MODEM_PATH)):
+                    if (path == MODEM_PATH and not caps["modem"]) or \
+                            (path == MACHINE_PATH and prop not in caps["machine_props"]):
+                        continue
+                    try:
+                        caps["values"][prop] = self.qmp.qom_get(path, prop)
+                    except QMPError:
+                        pass
+                self._status_q.put(("probe", caps))
+            except QMPError as ex:
+                self._status_q.put(("warn", "Phone: %s" % ex))
+
+        def _apply_probe(self, caps):
+            self._phone = caps
+            ui = self._phone_ui
+            if self._phone_win is None or not ui:
+                return
+            vals = caps["values"]
+            self._set_group_state(self._modem_widgets, caps["modem"])
+            if not caps["modem"]:
+                ui["nomodem"].pack(fill="x", padx=8, before=ui["note"])
+                ui["nb"].select(3)
+            self._set_group_state(self._battery_widgets, caps["battery"])
+            if not caps["charging"]:
+                for rb in ui["charging_buttons"]:
+                    rb.state(["disabled"])
+            if not caps["usb"]:
+                ui["usb_check"].state(["disabled"])
+            if isinstance(vals.get("battery-level"), int):
+                ui["batt_scale"].set(vals["battery-level"])
+            if isinstance(vals.get("usb-attached"), bool):
+                ui["usb"].set(vals["usb-attached"])
+            if isinstance(vals.get("signal-dbm"), int):
+                ui["dbm_scale"].set(vals["signal-dbm"])
+            if isinstance(vals.get("carrier"), str):
+                ui["carrier"].set(vals["carrier"])
+            if isinstance(vals.get("mcc-mnc"), str):
+                ui["plmn"].set(vals["mcc-mnc"])
+            if isinstance(vals.get("registered"), bool):
+                ui["registered"].set(not vals["registered"])
+            if isinstance(vals.get("sim-present"), bool):
+                ui["nosim"].set(not vals["sim-present"])
+
+        def _poll_callstate(self):
+            if self._phone_win is None or self._closing:
+                return
+            if self._phone and self._phone["modem"] and not self._callstate_busy and self._connected:
+                self._callstate_busy = True
+
+                def work():
+                    try:
+                        self._status_q.put(("callstate", str(self.qmp.qom_get(MODEM_PATH, "call-state"))))
+                    except QMPError:
+                        pass
+                    finally:
+                        self._callstate_busy = False
+                threading.Thread(target=work, daemon=True).start()
+            self.after(2000, self._poll_callstate)
+
+        def _do_call(self):
+            num = self._phone_ui["call_num"].get().strip()
+            if not valid_phone_number(num):
+                self._set_status("Call: number must be 1-20 digits, optionally starting with +")
+                return
+            self._modem("incoming-call", num, "Ringing from %s" % num)
+
+        def _do_sms(self):
+            try:
+                value = sms_value(self._phone_ui["sms_num"].get(), self._phone_ui["sms_text"].get("1.0", "end-1c"))
+            except ValueError as ex:
+                self._set_status("SMS: %s" % ex)
+                return
+            self._modem("incoming-sms", value, "SMS delivered")
+
+        def _carrier_picked(self, _e=None):
+            ui = self._phone_ui
+            for name, plmn in CARRIERS:
+                if name == ui["carrier"].get():
+                    ui["plmn"].set(plmn)
+
+        def _do_carrier(self):
+            ui = self._phone_ui
+            name, plmn = ui["carrier"].get().strip(), ui["plmn"].get().strip()
+            if not valid_carrier(name):
+                self._set_status("Carrier: 1-32 printable characters, no double quotes")
+                return
+            if not valid_plmn(plmn):
+                self._set_status("MCC-MNC: 5 or 6 digits (MCC + MNC)")
+                return
+
+            def work():                      # plmn first, then the name: the name change re-announces the operator
+                try:
+                    self.qmp.qom_set(MODEM_PATH, "mcc-mnc", plmn)
+                    self.qmp.qom_set(MODEM_PATH, "carrier", name)
+                    self._status_q.put(("info", "Carrier is now %s (%s)" % (name, plmn)))
+                except QMPError as ex:
+                    self._status_q.put(("warn", "carrier: %s" % ex))
+            threading.Thread(target=work, daemon=True).start()
+
+        def _set_signal(self, dbm):
+            self._phone_ui["dbm_scale"].set(dbm)
+            self._modem("signal-dbm", dbm, "Signal %d dBm" % dbm)
+
+        def _set_battery(self, pct):
+            self._phone_ui["batt_scale"].set(pct)
+            self._machine("battery-level", int(pct), "Battery %d %%" % pct)
+
+        def _do_charging(self):
+            mode = self._phone_ui["charging"].get()
+            args = charging_args(self._phone["machine_props"] if self._phone else (), mode)
+            if args is None:
+                self._set_status("This machine has no charging control")
+                return
+            self._machine(args[0], args[1], "Charging: %s" % mode)
+
         # -- screenshot ------------------------------------------------------
         def _screenshot(self):
             if not self._connected:
@@ -800,6 +1197,7 @@ def _gui_main(args, run=True):
                     pass
             if self.grabber:
                 self.grabber.stop_ev.set()
+            self._phone_win = None
             self.qmp.close()
             self.destroy()
 
@@ -821,6 +1219,9 @@ class _FakeQEMU(threading.Thread):
         super().__init__(daemon=True)
         self.path, self.w, self.h = path, w, h
         self.events, self.errors_for = [], set()
+        self.qom_sets = []
+        self.qom_tree = {"/machine": ["battery-level", "usb-attached", "baseband-modem", "battery-charging"]}
+        self.qom_vals = {("/machine", "battery-level"): 80, ("/machine/baseband-modem", "call-state"): "idle"}
         self.shade = 0
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(path)
@@ -841,6 +1242,18 @@ class _FakeQEMU(threading.Thread):
             elif cmd == "input-send-event":
                 self.events.append(a["events"])
                 out = {"return": {}}
+            elif cmd == "qom-set":
+                self.qom_sets.append(a)
+                out = {"return": {}}
+            elif cmd == "qom-list":
+                if a["path"] in self.qom_tree:
+                    out = {"return": [{"name": n, "type": "int"} for n in self.qom_tree[a["path"]]]}
+                else:
+                    out = {"error": {"class": "GenericError", "desc": "Device '%s' not found" % a["path"]}}
+            elif cmd == "qom-get":
+                v = self.qom_vals.get((a["path"], a["property"]))
+                out = {"return": v} if v is not None else \
+                    {"error": {"class": "GenericError", "desc": "Property '%s' not found" % a["property"]}}
             elif cmd == "screendump":
                 px = bytes([self.shade, 80, 160]) * (self.w * self.h)
                 with open(a["filename"], "wb") as g:
@@ -910,6 +1323,38 @@ def selftest():
           and abs(gesture_fingers("pan2", 0.2, 0.3, 480)[1][0] - 0.3) < 1e-9
           and gesture_fingers("pan2", 0.98, 0.3, 480)[1][0] == 1.0)
 
+    # phone controls
+    check("valid_phone_number: digits, optional leading +, 1-20 long",
+          [valid_phone_number(x) for x in ("5551234", "+15551234567", "1" * 20, "1" * 21, "", "+", "12a4", "1+2")]
+          == [True, True, True, False, False, False, False, False])
+    check("sms_value joins number and text, keeps '|' in the text",
+          sms_value(" +639171234567 ", "hi | there") == "+639171234567|hi | there")
+    for name, args in (("bad number", ("abc", "hi")), ("empty text", ("555", "   "))):
+        try:
+            sms_value(*args)
+            check("sms_value rejects %s" % name, False)
+        except ValueError:
+            check("sms_value rejects %s" % name, True)
+    check("valid_plmn: 5 or 6 digits", [valid_plmn(x) for x in ("00101", "310410", "1234", "1234567", "31a41")]
+          == [True, True, False, False, False])
+    check("valid_carrier: printable, <=32, no double quote",
+          [valid_carrier(x) for x in ("Globe", "", "x" * 32, "x" * 33, 'a"b', "a\nb")]
+          == [True, False, True, False, False, False])
+    check("every carrier preset passes its own validators",
+          all(valid_carrier(n) and valid_plmn(m) for n, m in CARRIERS))
+    check("charging_args: iPod/iPhone string property, A4 usb-charger bool, neither",
+          charging_args({"battery-charging"}, "on") == ("battery-charging", "on")
+          and charging_args({"usb-charger"}, "off") == ("usb-charger", False)
+          and charging_args({"usb-charger"}, "auto") == ("usb-charger", True)
+          and charging_args({"usb-attached"}, "on") is None)
+    caps = phone_caps(["battery-level", "baseband-modem", "usb-attached"])
+    check("phone_caps reads what /machine offers",
+          caps["modem"] and caps["battery"] and caps["usb"] and not caps["charging"])
+    check("qom_set_args shape", qom_set_args("/machine", "battery-level", 5)
+          == {"path": "/machine", "property": "battery-level", "value": 5})
+    check("signal presets stay inside the slider range",
+          all(SIGNAL_MIN_DBM <= d <= SIGNAL_MAX_DBM for _, d in SIGNAL_PRESETS))
+
     # PPM
     pix = bytes(range(24))
     check("parse_ppm with a comment", parse_ppm(b"P6\n# hi\n4 2\n255\n" + pix) == (4, 2, 16))
@@ -957,6 +1402,20 @@ def selftest():
         c.execute("x-event")
         time.sleep(0.2)
         check("QMP: events are delivered", seen_events == ["SHUTDOWN"], seen_events)
+
+        c.qom_set(MODEM_PATH, "incoming-sms", "555|hello")
+        c.qom_set(MACHINE_PATH, "battery-level", 15)
+        check("QMP: qom_set sends path/property/value",
+              srv.qom_sets == [{"path": MODEM_PATH, "property": "incoming-sms", "value": "555|hello"},
+                               {"path": MACHINE_PATH, "property": "battery-level", "value": 15}], srv.qom_sets)
+        check("QMP: qom_get returns the value", c.qom_get(MACHINE_PATH, "battery-level") == 80)
+        check("QMP: qom_names lists a path; a missing path is empty (no modem)",
+              "baseband-modem" in c.qom_names(MACHINE_PATH) and c.qom_names(MODEM_PATH) == [])
+        try:
+            c.qom_get(MODEM_PATH, "nope")
+            check("QMP: qom_get of a missing property raises", False)
+        except QMPError:
+            check("QMP: qom_get of a missing property raises", True)
 
         frames = []
         g = FrameGrabber(c, lambda w, h, data, off: frames.append((w, h, len(data) - off)), fps=60)
