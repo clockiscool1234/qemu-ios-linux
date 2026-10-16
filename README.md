@@ -49,11 +49,10 @@ Cloning the project:
 ```sh
 git clone https://github.com/clockiscool1234/qemu-ios-linux
 ```
-
 Building QEMU:
 ```sh
 mkdir build && cd build
-../configure --enable-sdl --disable-cocoa --target-list=arm-softmmu --disable-capstone --extra-cflags=-I/usr/include/openssl --extra-ldflags='-lcrypto' --disable-werror --enable-pie
+../configure --enable-sdl --enable-slirp --disable-cocoa --target-list=arm-softmmu --disable-capstone --extra-cflags=-I/usr/include/openssl --extra-ldflags='-lcrypto' --disable-werror --enable-pie
 make -j$(nproc)
 ```
 
@@ -65,6 +64,8 @@ On Linux, `tools/firmwarekit.py` unpacks Apple stock restore IPSWs, decrypts sys
 # System dependencies
 sudo apt-get install -y python3 hfsprogs libssl-dev
 ```
+
+
 
 ### Example: iPhone 4 GSM (`n90ap`)
 
