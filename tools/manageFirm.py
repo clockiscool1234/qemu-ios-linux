@@ -128,7 +128,7 @@ DEVICES: dict = {
         "product":       "iPad1,1",
         "qemu_machine":  "ipad1",
         "soc":           "S5L8930 (A4)",
-        "needs_sudo":    False,
+        "needs_sudo":    True,
         "needs_bootrom": False,
         "builds": {
             "7B367": "3.2",
@@ -143,7 +143,7 @@ DEVICES: dict = {
         "product":       "iPod4,1",
         "qemu_machine":  "iPod-Touch-4G",
         "soc":           "S5L8930 (A4)",
-        "needs_sudo":    False,
+        "needs_sudo":    True,
         "needs_bootrom": False,
         "builds": {
             "8B117": "4.1",
@@ -157,7 +157,7 @@ DEVICES: dict = {
         "product":       "iPhone3,1",
         "qemu_machine":  "iPhone-4",
         "soc":           "S5L8930 (A4)",
-        "needs_sudo":    False,
+        "needs_sudo":    True,
         "needs_bootrom": False,
         "needs_keybag":  True,
         "builds": {
@@ -755,7 +755,7 @@ class CreateDeviceDialog(tk.Toplevel):
         if not shutil.which("pkexec"):
             return ["sudo", "-E"] + cmd
         fwd = ["{}={}".format(k, os.environ[k])
-               for k in ("BOOTROM", "QEMU") if os.environ.get(k)]
+               for k in ("BOOTROM", "QEMU", "IT_KEYBAG") if os.environ.get(k)]
         return ["pkexec", "env"] + fwd + cmd
 
     def _run_create(

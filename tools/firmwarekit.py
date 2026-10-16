@@ -26,9 +26,11 @@ Boards that boot through a bootrom (m68ap, n45ap, n72ap) take `--bootrom PATH`: 
 --out (as bootrom_<soc>) and run.sh uses that copy, so no $BOOTROM is needed to run the device.
 
 NOT ported from Swift: guest package / GL hook, SystemConfiguration (Wi-Fi/proxy) seeding,
-HFS+ journaling, catalog date normalisation, re-signing of signed-era lockdownd, IMG3 decryption
+HFS+ journaling, catalog date normalisation, IMG3 decryption
 (n72/n88/k48/n81/n90 need decryption keys from the catalog; those boards produce a stub run.sh).
-Activation patch (1.x only) and rootfs decrypt/grow are fully ported for m68ap/n45ap.
+Activation patch and rootfs decrypt/grow are fully ported for m68ap/n45ap; the lockdownd activation patch
+(with ad-hoc re-signing of the signed-era binary) also runs on k48ap/n81ap/n90ap, needs root to mount the
+rootfs, and is skipped by --skip-activation.
 
 Requires: Python 3.9+, `cryptography`, and for `create`: root, the Linux `hfsplus` kernel
 module, and `dmg2img` or `7z` (for the rootfs DMG).
@@ -1065,8 +1067,11 @@ def with_mounted(volume, mnt, fn):
 #     cmp rN, #0 ; moveq flag, #1 ; ldreq state, =Unactivated ; ... ; beq store
 # changed to  `moveq flag, #0 ; ldreq state, =Activated`.  A present record is verified as before.
 #
-# Scope: the 1.x (unsigned) paths.  A lockdownd that carries LC_CODE_SIGNATURE, or a match that is
-# not a legacy initializer (signed-era firmware), is refused instead of re-signed.
+# Scope: every path activation.c knows.  The 1.x (unsigned) initializer is patched in place and left
+# unsigned.  A lockdownd that carries LC_CODE_SIGNATURE, or a match that is not a legacy initializer
+# (signed-era firmware: iOS 2.x-5.x, the A4 boards), is re-signed after the patch the way FirmwareKit's
+# Activation.signed does: every code-directory page hash is recomputed, CS_ADHOC is set, and the CMS blob
+# (which the patch invalidates) is dropped.  Size and signing allocation do not change.
 
 ACT_MESSAGE = b"Short circuiting activation state to Activated.\0"
 ACT_FUNCTION = "dealwith_activation"
@@ -1105,6 +1110,7 @@ class _Image:
         self.b = bytes(data) + bytes(64)  # padding so a stray read past the end is zeros, not an exception
         self.segments = []
         self.text_va = self.text_size = self.text_off = self.message_va = 0
+        self.sig = None  # LC_CODE_SIGNATURE (dataoff, datasize), if the binary carries one
 
     def u16(self, o):
         return self.b[o] | self.b[o + 1] << 8
@@ -1180,7 +1186,9 @@ def _act_parse(m):
         if ln < 8 or ln % 4 or not m.fits(o, ln, end):
             raise ActivationError("invalid load command size")
         if cmd == 0x1D:
-            raise ActivationError("lockdownd carries a code signature; re-signing is not ported (1.x is unsigned)")
+            if ln < 16 or m.sig is not None:
+                raise ActivationError("invalid code signature load command")
+            m.sig = (m.u32(o + 8), m.u32(o + 12))
         if cmd == 1:
             if ln < 56:
                 raise ActivationError("truncated segment")
@@ -1557,20 +1565,94 @@ def activation_strategy(match):
             else "development-activation-shortcut")
 
 
-def activate_lockdownd(data, allow_signed_era=False):
-    """-> (patched bytes, report).  Raises ActivationError (the input is never modified in place)."""
+def _be32(b, o):
+    return b[o] << 24 | b[o + 1] << 16 | b[o + 2] << 8 | b[o + 3]
+
+
+def resign_lockdownd(data, sig):
+    """Port of FirmwareKit's Activation.signed: rebuild the existing code-directory page hashes as an
+    ad-hoc signature, keeping entitlements and special-slot hashes.  The patch changes neither the size
+    nor the signing allocation.  -> bytes.  Raises ActivationError before anything is returned."""
+    b = bytearray(data)
+
+    def invalid():
+        return ActivationError("Unsupported code signature")
+
+    start, size = sig
+    if size < 12 or start > len(b) - size or _be32(b, start) != 0xFADE0CC0:
+        raise invalid()
+    length, count = _be32(b, start + 4), _be32(b, start + 8)
+    if length < 12 or length > size or count > (length - 12) // 8:
+        raise invalid()
+    entries, directories = [], 0
+    for i in range(count):
+        typ, offset = _be32(b, start + 12 + i * 8), _be32(b, start + 16 + i * 8)
+        if offset < 12 + count * 8 or offset > length - 8:
+            raise invalid()
+        blob = start + offset
+        blob_len = _be32(b, blob + 4)
+        if blob_len < 8 or blob_len > length - offset:
+            raise invalid()
+        if typ == 0 or 0x1000 <= typ <= 0x1005:  # CodeDirectory and its alternates
+            if blob_len < 44 or _be32(b, blob) != 0xFADE0C02:
+                raise invalid()
+            hash_off, special = _be32(b, blob + 16), _be32(b, blob + 24)
+            slots, limit = _be32(b, blob + 28), _be32(b, blob + 32)
+            hash_size, hash_type, exponent = b[blob + 36], b[blob + 37], b[blob + 39]
+            if not (0 < exponent <= 20 and 0 < limit <= start
+                    and ((hash_type == 1 and hash_size == 20) or (hash_type == 2 and hash_size == 32))
+                    and hash_off >= 44 + special * hash_size and hash_off <= blob_len
+                    and slots <= (blob_len - hash_off) // hash_size):
+                raise invalid()
+            page = 1 << exponent
+            if slots != (limit + page - 1) // page:
+                raise invalid()
+            if _be32(b, blob + 8) >= 0x20100:  # scatter layouts need a different page mapping
+                if blob_len < 48 or _be32(b, blob + 44) != 0:
+                    raise invalid()
+            put_be = struct.pack_into
+            put_be(">I", b, blob + 12, _be32(b, blob + 12) | 2)  # CS_ADHOC
+            algo = hashlib.sha1 if hash_type == 1 else hashlib.sha256
+            for slot in range(slots):
+                digest = algo(bytes(b[slot * page:min(limit, (slot + 1) * page)])).digest()
+                at = blob + hash_off + slot * hash_size
+                b[at:at + hash_size] = digest
+            directories += 1
+        if typ != 0x10000:  # drop the now-invalid CMS signature
+            entries.append((typ, offset))
+    if directories == 0 or not any(t == 0 for t, _ in entries):
+        raise invalid()
+    for i in range(count):
+        t, o = entries[i] if i < len(entries) else (0, 0)
+        struct.pack_into(">II", b, start + 12 + i * 8, t, o)
+    struct.pack_into(">I", b, start + 8, len(entries))
+    return bytes(b)
+
+
+def activate_lockdownd(data, allow_signed_era=True, resign=True):
+    """-> (patched bytes, report).  Raises ActivationError (the input is never modified in place).
+    A signed binary, or a signed-era match, comes back re-signed (ad hoc); the unsigned 1.x path stays
+    unsigned.  allow_signed_era=False restores the 1.x-only behaviour; resign=False patches the bytes only,
+    like the C original (activation.c leaves signing to the caller)."""
     m = _Image(data)
     _act_parse(m)
     match = _act_locate(m)
     if not match.legacy and not allow_signed_era:
-        raise ActivationError("matched a signed-era path (%s); this port patches 1.x only and does not re-sign"
+        raise ActivationError("matched a signed-era path (%s); signed-era patching is disabled"
                               % activation_strategy(match))
     out = bytearray(data)
     out[match.off:match.off + match.width] = match.replacement
+    resigned = False
+    if resign and (not match.legacy or m.sig is not None):
+        # Later paths still require a valid signature allocation; 1.x may stay unsigned.
+        if m.sig is None:
+            raise ActivationError("signed-era lockdownd has no code signature allocation to refresh")
+        out = bytearray(resign_lockdownd(bytes(out), m.sig))
+        resigned = True
     return bytes(out), {
         "strategy": activation_strategy(match), "isa": match.isa, "offset": match.off, "virtual_address": match.va,
         "width": match.width, "original": bytes(data[match.off:match.off + match.width]).hex(),
-        "replacement": match.replacement.hex(),
+        "replacement": match.replacement.hex(), "resigned": resigned,
         "input_sha256": hashlib.sha256(data).hexdigest(), "output_sha256": hashlib.sha256(bytes(out)).hexdigest(),
     }
 
@@ -1591,8 +1673,9 @@ def activate_volume(m, log=print):
             f.write(after)
     finally:
         os.chmod(path, mode)
-    log("activation: %s at file offset 0x%x (%s): %s -> %s" % (rep["strategy"], rep["offset"], rep["isa"],
-                                                              rep["original"], rep["replacement"]))
+    log("activation: %s at file offset 0x%x (%s): %s -> %s%s" % (
+        rep["strategy"], rep["offset"], rep["isa"], rep["original"], rep["replacement"],
+        " (re-signed ad hoc)" if rep.get("resigned") else ""))
     return rep
 
 
@@ -1904,6 +1987,30 @@ _KBOOT_BOOTROMS = {
 }
 
 
+# A4 boards whose iOS 4.x/5.x lockdownd is patched and re-signed at create time.
+_ACTIVATED_KBOOT = ("k48ap", "n81ap", "n90ap")
+
+
+def activate_kboot_rootfs(system_img, work, log=print):
+    """Patch + re-sign lockdownd inside the extracted rootfs image.  The edit is in place and the same size, so the
+    volume layout does not change.  A failure is reported, not fatal: the bundle is still produced, unactivated."""
+    mnt = os.path.join(work, "mnt_sys")
+    print("activating lockdownd in the rootfs...")
+    try:
+        rep = with_mounted(system_img, mnt, lambda m: activate_volume(m, log))
+        print("  lockdownd: %s -> %s" % (rep["input_sha256"][:12], rep["output_sha256"][:12]))
+        return rep
+    except FirmwareError as e:
+        print("warning: lockdownd was NOT activated (%s)" % e)
+        print("         rerun as root, or pass --skip-activation to silence this")
+        return None
+    finally:
+        try:
+            os.rmdir(mnt)
+        except OSError:
+            pass
+
+
 def create_kboot(args, entry, ipsw, ri, out, work):
     """Build kboot.bin and NAND store for KBoot boards (n18, n88, n81, n90, k48)."""
     board = ri["board"]
@@ -1946,6 +2053,11 @@ def create_kboot(args, entry, ipsw, ri, out, work):
     system_img = os.path.join(work, "system.img")
     print("extracting HFS+ volume from rootfs.dmg...")
     extract_rootfs(dec_dmg, system_img, work)
+
+    # 4b. lockdownd activation (A4 boards, iOS 4.x/5.x): patch the signed lockdownd in the rootfs and
+    #     re-sign it, like FirmwareKit's SystemEdits.activate.  Needs root + the Linux hfsplus module.
+    if board in _ACTIVATED_KBOOT and not getattr(args, "skip_activation", False):
+        activate_kboot_rootfs(system_img, work)
 
     # 5. Build NAND store
     print("building NAND store...")
@@ -2501,6 +2613,52 @@ def _kind_arm_dev():
     return s.build()
 
 
+def _synth_signed(data, hash_type=1, cms=True, junk=0xAA):
+    """A synthetic lockdownd with an LC_CODE_SIGNATURE: a SuperBlob holding one CodeDirectory (2 special
+    slots, 4 KiB pages, deliberately wrong page hashes) and, with cms=True, a CMS blob.  -> (bytes, start, size)."""
+    hsz = 20 if hash_type == 1 else 32
+    start = len(data)
+    nslots = (start + 4095) // 4096
+    ident = b"lockdownd\0\0\0"  # 12 bytes
+    hash_off = 44 + len(ident) + 2 * hsz
+    cd = bytearray(hash_off + nslots * hsz)
+    struct.pack_into(">IIIIIIIII", cd, 0, 0xFADE0C02, len(cd), 0x20001, 0, hash_off, 44, 2, nslots, start)
+    cd[36], cd[37], cd[38], cd[39] = hsz, hash_type, 0, 12
+    cd[44:44 + len(ident)] = ident
+    for i in range(2 * hsz):
+        cd[44 + len(ident) + i] = 0x5A  # special slots: must survive untouched
+    for i in range(nslots * hsz):
+        cd[hash_off + i] = junk
+    n = 2 if cms else 1
+    body = bytearray()
+    index = [(0, 12 + n * 8)]
+    body += cd
+    if cms:
+        index.append((0x10000, 12 + n * 8 + len(cd)))
+        body += struct.pack(">II", 0xFADE0B01, 16) + bytes(8)
+    sb = bytearray(struct.pack(">III", 0xFADE0CC0, 12 + n * 8 + len(body), n))
+    for t, o in index:
+        sb += struct.pack(">II", t, o)
+    sb += body
+    size = len(sb) + 16  # a little spare allocation, as the signer leaves
+    b = bytearray(data)
+    b[0x10:0x14] = struct.pack("<I", 2)           # ncmds
+    b[0x14:0x18] = struct.pack("<I", 124 + 16)    # sizeofcmds
+    b[152:168] = struct.pack("<IIII", 0x1D, 16, start, size)
+    return bytes(b) + bytes(sb) + bytes(size - len(sb)), start, size
+
+
+def _sig_pages_ok(b, start, hash_type=1):
+    """Every code-directory page hash matches the bytes it covers (the synthetic layout above)."""
+    hsz = 20 if hash_type == 1 else 32
+    algo = hashlib.sha1 if hash_type == 1 else hashlib.sha256
+    cd = start + _be32(b, start + 16)
+    hash_off, nslots, limit = struct.unpack_from(">III", b, cd + 16)[0], struct.unpack_from(">I", b, cd + 28)[0], \
+        struct.unpack_from(">I", b, cd + 32)[0]
+    return all(bytes(b[cd + hash_off + i * hsz:cd + hash_off + (i + 1) * hsz])
+               == algo(bytes(b[i * 4096:min(limit, (i + 1) * 4096)])).digest() for i in range(nslots))
+
+
 SYNTH_KINDS = {
     "conditional": _kind_conditional, "legacy_early": _kind_legacy_early, "legacy_b": _kind_legacy_b,
     "shared": _kind_shared, "thumb_dev": _kind_thumb_dev, "arm_dev": _kind_arm_dev,
@@ -2527,7 +2685,7 @@ def difftest(args):
 
     def run_py(data):
         try:
-            _, rep = activate_lockdownd(data, allow_signed_era=True)
+            _, rep = activate_lockdownd(data, resign=False)
             return ("ok", rep["strategy"], rep["isa"], rep["offset"], rep["width"], rep["original"], rep["replacement"])
         except ActivationError:
             return ("fail",)
@@ -2540,7 +2698,7 @@ def difftest(args):
         print("%-14s base: %s" % (name, "MATCH" if c == p else "MISMATCH %s %s" % (c, p)))
         bad += c != p
         if p[0] == "ok":
-            patched, _ = activate_lockdownd(base, allow_signed_era=True)
+            patched, _ = activate_lockdownd(base, resign=False)
             bad += run_c(patched) != run_py(patched)
         variants = [dict(flag=3, state=4), dict(flag=5, state=0), dict(at=0xA0)]
         for kw in variants if name in ("conditional", "legacy_early", "legacy_b", "shared") else []:
@@ -2747,7 +2905,7 @@ def selftest(_args):
         for kind in ("conditional", "legacy_early", "legacy_b", "shared"):
             data = SYNTH_KINDS[kind]()
             try:
-                out, rep = activate_lockdownd(data, allow_signed_era=True)
+                out, rep = activate_lockdownd(data, resign=False)
                 good = rep["strategy"].endswith("no-record-initializer") and len(out) == len(data) and out != data
                 if kind == "conditional":
                     o = rep["offset"]
@@ -2772,19 +2930,63 @@ def selftest(_args):
             except ActivationError:
                 check("activation: refuses %s" % name, True)
         try:
-            activate_lockdownd(SYNTH_KINDS["thumb_dev"]())
+            activate_lockdownd(SYNTH_KINDS["thumb_dev"](), allow_signed_era=False)
             check("activation: signed-era match refused without allow_signed_era", False)
         except ActivationError:
             check("activation: signed-era match refused without allow_signed_era", True)
+        # a bogus (empty) signature allocation is refused, never half-signed
         sig = bytearray(SYNTH_KINDS["conditional"]())
         sig[0x14:0x18] = struct.pack("<I", 124 + 16)           # sizeofcmds
         sig[0x10:0x14] = struct.pack("<I", 2)                  # ncmds
-        sig[152:168] = struct.pack("<IIII", 0x1D, 16, 0, 0)    # LC_CODE_SIGNATURE
+        sig[152:168] = struct.pack("<IIII", 0x1D, 16, 0, 0)    # LC_CODE_SIGNATURE, empty
         try:
             activate_lockdownd(bytes(sig))
-            check("activation: refuses a signed lockdownd (no re-signing here)", False)
+            check("activation: refuses an unusable code signature", False)
         except ActivationError as e:
-            check("activation: refuses a signed lockdownd (no re-signing here)", "signature" in str(e), str(e))
+            check("activation: refuses an unusable code signature", "signature" in str(e), str(e))
+        # signed-era firmware (iOS 4/5, the A4 boards): patched, then re-signed ad hoc
+        for kind in ("conditional", "thumb_dev", "shared"):
+            for ht in (1, 2):
+                base = SYNTH_KINDS[kind]()
+                signed, start, size = _synth_signed(base, hash_type=ht)
+                try:
+                    out, rep = activate_lockdownd(signed)
+                except FirmwareError as e:
+                    check("activation: %s signed (hash %d) is patched and re-signed" % (kind, ht), False, str(e))
+                    continue
+                o, w = rep["offset"], rep["width"]
+                cd = start + _be32(out, start + 16)
+                special = 44 + 12
+                good = (len(out) == len(signed) and rep["resigned"]
+                        and _sig_pages_ok(out, start, ht)                                  # hashes cover the patched pages
+                        and out[o:o + w] == bytes.fromhex(rep["replacement"])              # the patch is in
+                        and le32(out, 0) == 0xFEEDFACE
+                        and struct.unpack_from(">I", out, cd + 12)[0] & 2                   # CS_ADHOC set
+                        and struct.unpack_from(">I", out, start + 8)[0] == 1               # CMS entry dropped
+                        and bytes(out[cd + special:cd + special + 2 * (20 if ht == 1 else 32)])
+                        == bytes([0x5A]) * (2 * (20 if ht == 1 else 32))                  # special slots untouched
+                        and out[:start] != signed[:start])
+                check("activation: %s signed (hash %d) is patched and re-signed" % (kind, ht), good)
+        base = SYNTH_KINDS["conditional"]()
+        signed, start, size = _synth_signed(base, cms=False)
+        out, rep = activate_lockdownd(signed)
+        check("activation: a signature without a CMS blob is refreshed too",
+              _sig_pages_ok(out, start) and struct.unpack_from(">I", out, start + 8)[0] == 1)
+        out2, rep2 = activate_lockdownd(base)
+        check("activation: unsigned 1.x lockdownd stays unsigned", not rep2["resigned"] and len(out2) == len(base))
+        try:
+            activate_lockdownd(SYNTH_KINDS["thumb_dev"]())
+            check("activation: signed-era match with no signature allocation is refused", False)
+        except ActivationError as e:
+            check("activation: signed-era match with no signature allocation is refused", "signature" in str(e), str(e))
+        bad, _, _ = _synth_signed(SYNTH_KINDS["conditional"]())
+        mangled = bytearray(bad)
+        mangled[len(SYNTH_KINDS["conditional"]()) + 4:len(SYNTH_KINDS["conditional"]()) + 8] = b"\xff\xff\xff\xff"
+        try:
+            activate_lockdownd(bytes(mangled))
+            check("activation: a corrupt SuperBlob is refused", False)
+        except ActivationError:
+            check("activation: a corrupt SuperBlob is refused", True)
 
     # bootrom bundling: resolve, copy into the device folder, run.sh prefers the copy from any cwd
     d = tempfile.mkdtemp(prefix="bootrom-selftest-")
@@ -2875,7 +3077,7 @@ def main():
     c.add_argument("--no-volume-edit", action="store_true",
                    help="skip mount-and-edit (m68ap/n45ap only; image will NOT boot as-is)")
     c.add_argument("--skip-activation", action="store_true",
-                   help="leave lockdownd unpatched (m68ap/n45ap 1.x only)")
+                   help="leave lockdownd unpatched (m68ap/n45ap, and k48ap/n81ap/n90ap)")
     c.add_argument("--skip-sha1", "--skip-sha1sum", dest="skip_sha1", action="store_true",
                    help="skip checking the IPSW SHA-1 hash against the catalog")
     c.add_argument("--bootrom", metavar="PATH",

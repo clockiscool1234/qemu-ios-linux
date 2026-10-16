@@ -50,7 +50,7 @@ sudo apt-get update
 sudo apt-get install -y python3 hfsprogs libssl-dev
 ```
 
-- **Root / `sudo` Privileges**: Required when generating images for `m68ap` (iPhone 2G) and `n45ap` (iPod Touch 1G). The tool decrypts the system DMG, grows the HFS+ volume, mounts it via a loop device to patch `fstab`, disable watchdog daemons, and inject the activation bypass into `lockdownd`.
+- **Root / `sudo` Privileges**: Required when generating images for `m68ap` (iPhone 2G) and `n45ap` (iPod Touch 1G). On `k48ap` (iPad 1), `n81ap` and `n90ap` (iPhone 4) root is needed only for the `lockdownd` activation patch (below): the rootfs is loop-mounted read-write to patch and re-sign `usr/libexec/lockdownd`. Without root the bundle is still built, with a warning, and `lockdownd` is left stock; `--skip-activation` silences it. The tool decrypts the system DMG, grows the HFS+ volume, mounts it via a loop device to patch `fstab`, disable watchdog daemons, and inject the activation bypass into `lockdownd`.
 - **Bootrom Files** (`m68ap`, `n45ap`, `n72ap` only): pass the raw SoC bootrom dump with `--bootrom <path>`. It is copied into the device folder (`bootrom_s5l8900` / `bootrom_s5l8720`) and `run.sh` uses that copy, so the device folder is self-contained and `$BOOTROM` is not needed. Without `--bootrom`, `run.sh` falls back to `$BOOTROM`.
 
 ---
@@ -75,7 +75,7 @@ python3 tools/firmwarekit.py create [OPTIONS]
 - `--tmpdir <path>`: Parent directory where the auto-generated work directory should be created.
 - `--keep-work`: Retain intermediate files in the work directory after completion.
 - `--no-volume-edit`: Skip mount-and-edit step for `m68ap`/`n45ap` (useful for fast testing without root).
-- `--skip-activation`: Do not patch `lockdownd` on iPhone OS 1.x.
+- `--skip-activation`: Do not patch `lockdownd` (iPhone OS 1.x on `m68ap`/`n45ap`; iOS 4.x/5.x on `k48ap`/`n81ap`/`n90ap`).
 - `--skip-sha1`, `--skip-sha1sum`: Skip checking the IPSW SHA-1 hash against the catalog entry. Useful for faster processing, testing slightly modified/re-packaged IPSWs, or when the hash in the catalog differs.
 - `--bootrom <path>`: Bootrom for boards that boot through one (`m68ap`/`n45ap`: S5L8900, `n72ap`: S5L8720). Copied into `--out` as `bootrom_<soc>`; `run.sh` prefers that copy over `$BOOTROM`. Ignored (with a note) for boards that boot via kboot.
 - `--helper <path>`: Path to `it_keybag` guest helper binary (armv7) for iOS 4.x/5.x effaceable storage and system keybag provisioning. If not specified, automatically looks for `tools/it_keybag`, `build/ipad1-guest/it_keybag`, `contrib/it-keybag/it_keybag`, `build/it_keybag`, or `$IT_KEYBAG`.
@@ -399,3 +399,13 @@ Every generated `run.sh` contains an automated trap:
 trap 'rm -rf /tmp/<board>-*' EXIT
 ```
 When QEMU terminates (or is interrupted with `Ctrl+C`), any temporary overlay directories and NOR buffers created in `/tmp/` are cleaned up automatically.
+
+## `lockdownd` activation patch on A4 boards (`k48ap`, `n81ap`, `n90ap`)
+
+`firmwarekit.py create` patches `usr/libexec/lockdownd` in the decrypted rootfs before the NAND store is built, so the guest reports Activated and boots past Setup. It is a port of FirmwareKit's `CActivation/activation.c` and `Activation.signed`:
+
+1. The patch site is found by pattern (no firmware offsets); the edit is the same size and done in place, keeping the HFS+ catalog record, owner and mode.
+2. iOS 4.x/5.x `lockdownd` is code-signed, and the edit invalidates its page hashes. The code directory's page hashes are recomputed (SHA-1 or SHA-256, per the existing directory), `CS_ADHOC` is set, and the CMS blob is dropped. Entitlements and special-slot hashes are kept. This needs a kernel that does not enforce signing chains, as the emulated A4 kernel cache does.
+3. If no known activation path matches, or the signature allocation is unusable, the file is left unchanged and `create` prints a warning instead of failing.
+
+`python3 tools/firmwarekit.py selftest` covers the signing path on synthetic binaries; `difftest <activation.c>` checks the byte patch against the C original.
