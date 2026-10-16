@@ -3,12 +3,15 @@
 tools/manageFirm.py  —  QEMU-iOS Device Manager (Linux)
 
 Manage virtual iOS device bundles stored under a base directory (default /opt).
+Device folders are named <prefix><board>_<build> (default prefix "DEV_").  The base
+directory and the prefix can be changed from the Settings button (saved to
+~/.config/qemu-ios/manageFirm.json) or overridden with --base / --prefix.
   •  Create devices using tools/firmwarekit.py, with optional IPSW auto-download
   •  Start / stop QEMU for a device via its generated run.sh
   •  Delete device folders
 
 Usage:
-    python3 tools/manageFirm.py [--base /opt] [--catalog path/to/firmware-catalog.json]
+    python3 tools/manageFirm.py [--base /opt] [--prefix DEV_] [--catalog path/to/firmware-catalog.json]
 
 Environment:
     QEMU     Path to qemu-system-arm  (auto-detected from build/ or PATH if unset)
@@ -177,6 +180,11 @@ DEFAULT_CAT = REPO_ROOT / "iphone" / "firmware-catalog.json"
 IPSW_ME_API = "https://api.ipsw.me/v4/ipsw/{product}/{build}"
 _UA         = "qemu-ios-manageFirm/1.0"
 
+DEFAULT_BASE   = "/opt"
+DEFAULT_PREFIX = "DEV_"
+CONFIG_PATH    = (Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+                  / "qemu-ios" / "manageFirm.json")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility helpers
@@ -218,12 +226,36 @@ def download_url_to_file(
                     on_progress(done, total)
 
 
-def scan_devices(base: Path) -> list:
-    """Return a list of device-info dicts for every DEV_<board>_<build> dir."""
+def load_config() -> dict:
+    """Read the saved settings (base dir, name prefix); {} if none/unreadable."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def valid_prefix(prefix: str) -> bool:
+    """A prefix must be non-empty and safe to use inside a directory name."""
+    return bool(prefix) and not re.search(r"[/\\\0\s]", prefix)
+
+
+def device_dirname(prefix: str, board: str, build: str) -> str:
+    return "{}{}_{}".format(prefix, board, build)
+
+
+def scan_devices(base: Path, prefix: str = DEFAULT_PREFIX) -> list:
+    """Return a list of device-info dicts for every <prefix><board>_<build> dir."""
     out = []
     if not base.is_dir():
         return out
-    pat = re.compile(r"^DEV_(?P<board>[A-Za-z0-9]+)_(?P<build>.+)$")
+    pat = re.compile(
+        r"^" + re.escape(prefix) + r"(?P<board>[A-Za-z0-9]+)_(?P<build>.+)$")
     for entry in sorted(base.iterdir()):
         if not entry.is_dir():
             continue
@@ -277,6 +309,7 @@ class CreateDeviceDialog(tk.Toplevel):
         self,
         parent,
         base_dir: Path,
+        prefix:   str,
         catalog:  Path,
         log_fn:   Callable,
     ) -> None:
@@ -287,6 +320,7 @@ class CreateDeviceDialog(tk.Toplevel):
         self.transient(parent)
 
         self._base    = base_dir
+        self._prefix  = prefix
         self._catalog = catalog
         self._log     = log_fn
         self._proc    = None
@@ -439,7 +473,7 @@ class CreateDeviceDialog(tk.Toplevel):
     def _refresh_out(self) -> None:
         board = self._cur_board()
         build = self._cur_build()
-        self._out_var.set(str(self._base / "DEV_{}_{}".format(board, build)))
+        self._out_var.set(str(self._base / device_dirname(self._prefix, board, build)))
 
     def _toggle_ipsw(self) -> None:
         is_browse = self._ipsw_mode.get() == "browse"
@@ -470,6 +504,24 @@ class CreateDeviceDialog(tk.Toplevel):
         if p:
             self._bootrom_var.set(p)
 
+    def _ui(self, fn: Callable, delay: int = 0) -> None:
+        """Run fn on the Tk thread, but only if this dialog still exists.
+
+        The create flow runs in a worker thread and keeps reporting progress
+        after the dialog was closed; touching destroyed widgets raised the
+        'invalid command name ...progressbar' TclErrors.
+        """
+        def _run():
+            try:
+                if self.winfo_exists():
+                    fn()
+            except tk.TclError:
+                pass
+        try:
+            self.after(delay, _run)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _set_status(self, msg: str, busy: bool = False) -> None:
         def _do():
             self._status_var.set(msg)
@@ -477,7 +529,7 @@ class CreateDeviceDialog(tk.Toplevel):
                 self._pbar.start(10)
             else:
                 self._pbar.stop()
-        self.after(0, _do)
+        self._ui(_do)
 
     # ── create flow ──────────────────────────────────────────────────────────
 
@@ -537,7 +589,7 @@ class CreateDeviceDialog(tk.Toplevel):
         if not dl_url:
             self._set_status(
                 "Could not find IPSW on ipsw.me.  Try browsing for the file.")
-            self.after(0, lambda: self._create_btn.configure(state="normal"))
+            self._ui(lambda: self._create_btn.configure(state="normal"))
             return
 
         fname = ipsw_filename(product, version, build)
@@ -560,16 +612,32 @@ class CreateDeviceDialog(tk.Toplevel):
                     dest.unlink()
                 except OSError:
                     pass
-                self.after(0, lambda: self._create_btn.configure(state="normal"))
+                self._ui(lambda: self._create_btn.configure(state="normal"))
                 return
 
         self._set_status("Download complete. Running firmwarekit.py…", busy=True)
         self._run_create(board, dev, build, str(dest), out, cat)
 
+    @staticmethod
+    def _as_root(cmd: list) -> list:
+        """Prefix cmd so it runs as root, via pkexec (sudo if pkexec is absent).
+
+        pkexec starts the program in a sanitised environment and in root's
+        home directory, so relative paths are made absolute and the variables
+        firmwarekit needs are passed explicitly through env(1).
+        """
+        if not shutil.which("pkexec"):
+            return ["sudo", "-E"] + cmd
+        fwd = ["{}={}".format(k, os.environ[k])
+               for k in ("BOOTROM", "QEMU") if os.environ.get(k)]
+        return ["pkexec", "env"] + fwd + cmd
+
     def _run_create(
         self, board: str, dev: dict, build: str,
         ipsw: str, out: str, cat: str
     ) -> None:
+        ipsw, cat, out = (os.path.abspath(os.path.expanduser(x))
+                          for x in (ipsw, cat, out))
         cmd = [
             sys.executable, str(FIRMWAREKIT), "create",
             "--ipsw",    ipsw,
@@ -582,9 +650,14 @@ class CreateDeviceDialog(tk.Toplevel):
         if seed:
             cmd += ["--seed", seed]
         if bootrom:
-            os.environ["BOOTROM"] = bootrom
+            os.environ["BOOTROM"] = os.path.abspath(os.path.expanduser(bootrom))
         if dev.get("needs_sudo"):
-            cmd = ["sudo", "-E"] + cmd
+            cmd = self._as_root(cmd)
+
+        try:
+            Path(out).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass    # firmwarekit (as root) may still be able to create it
 
         self._set_status("Running firmwarekit.py…", busy=True)
         self._log("$ " + " ".join(str(x) for x in cmd))
@@ -598,7 +671,7 @@ class CreateDeviceDialog(tk.Toplevel):
             rc = self._proc.returncode
             if rc == 0:
                 self._set_status("Device created successfully!")
-                self.after(2500, self._close)
+                self._ui(self._close, 2500)
             else:
                 self._set_status(
                     "firmwarekit.py exited with code {}.".format(rc))
@@ -606,7 +679,7 @@ class CreateDeviceDialog(tk.Toplevel):
             self._set_status("Error: {}".format(exc))
         finally:
             self._proc = None
-            self.after(0, lambda: self._create_btn.configure(state="normal"))
+            self._ui(lambda: self._create_btn.configure(state="normal"))
 
     # ── close ────────────────────────────────────────────────────────────────
 
@@ -621,18 +694,108 @@ class CreateDeviceDialog(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Settings dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SettingsDialog(tk.Toplevel):
+    """Change where devices live and how their folders are named."""
+
+    def __init__(self, parent, base_dir: Path, prefix: str,
+                 on_save: Callable) -> None:
+        super().__init__(parent)
+        self.title("Settings")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self._on_save = on_save
+
+        P = {"padx": 8, "pady": 4, "sticky": "w"}
+        f = ttk.Frame(self, padding=10)
+        f.pack(fill="both", expand=True)
+
+        ttk.Label(f, text="Device folder:").grid(row=0, column=0, **P)
+        self._base_var = tk.StringVar(value=str(base_dir))
+        ttk.Entry(f, textvariable=self._base_var, width=44).grid(
+            row=0, column=1, **P)
+        ttk.Button(f, text="Browse…", command=self._browse).grid(
+            row=0, column=2, **P)
+
+        ttk.Label(f, text="Name prefix:").grid(row=1, column=0, **P)
+        self._prefix_var = tk.StringVar(value=prefix)
+        ttk.Entry(f, textvariable=self._prefix_var, width=20).grid(
+            row=1, column=1, **P)
+
+        self._example = ttk.Label(f, text="", foreground="gray")
+        self._example.grid(row=2, column=1, columnspan=2, **P)
+        ttk.Label(
+            f, foreground="gray", wraplength=480, justify="left",
+            text="Only folders named <prefix><board>_<build> inside the device "
+                 "folder are listed, so devices created with a different "
+                 "prefix or in another folder will not show up.",
+        ).grid(row=3, column=0, columnspan=3, **P)
+
+        bf = ttk.Frame(f)
+        bf.grid(row=4, column=0, columnspan=3, pady=8)
+        ttk.Button(bf, text="Save", command=self._save).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(
+            side="left", padx=6)
+
+        self._base_var.trace_add("write", lambda *_: self._update_example())
+        self._prefix_var.trace_add("write", lambda *_: self._update_example())
+        self._update_example()
+
+    def _update_example(self) -> None:
+        self._example.configure(text="Example:  {}".format(
+            Path(self._base_var.get().strip() or ".")
+            / device_dirname(self._prefix_var.get().strip(), "n88ap", "9B206")))
+
+    def _browse(self) -> None:
+        cur = Path(os.path.expanduser(self._base_var.get().strip() or "~"))
+        while not cur.is_dir() and cur != cur.parent:
+            cur = cur.parent
+        p = filedialog.askdirectory(parent=self, initialdir=str(cur),
+                                    title="Select device folder")
+        if p:
+            self._base_var.set(p)
+
+    def _save(self) -> None:
+        raw    = self._base_var.get().strip()
+        prefix = self._prefix_var.get().strip()
+        if not raw:
+            messagebox.showwarning("Missing folder",
+                                   "Specify a device folder.", parent=self)
+            return
+        base = Path(os.path.expanduser(raw))
+        if base.exists() and not base.is_dir():
+            messagebox.showwarning("Not a folder",
+                                   "{} is not a folder.".format(base),
+                                   parent=self)
+            return
+        if not valid_prefix(prefix):
+            messagebox.showwarning(
+                "Invalid prefix",
+                "The prefix must not be empty and must not contain spaces "
+                "or slashes.", parent=self)
+            return
+        self._on_save(base, prefix)
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main window
 # ─────────────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
 
-    def __init__(self, base_dir: Path, catalog: Path) -> None:
+    def __init__(self, base_dir: Path, catalog: Path,
+                 prefix: str = DEFAULT_PREFIX) -> None:
         super().__init__()
         self.title("QEMU-iOS Device Manager")
         self.geometry("980x650")
         self.minsize(720, 460)
 
         self._base    = base_dir
+        self._prefix  = prefix
         self._catalog = catalog
         self._devs: list    = []
         self._running: dict = {}   # path_str → subprocess.Popen
@@ -665,8 +828,10 @@ class App(tk.Tk):
         ttk.Separator(tb, orient="vertical").pack(
             side="left", fill="y", padx=6, pady=2)
         tb_btn("↺  Refresh",  self.refresh)
-        ttk.Label(tb, text="  Base: {}".format(self._base),
-                  foreground="gray").pack(side="right", padx=8)
+        tb_btn("⚙  Settings", self._open_settings)
+        self._base_lbl = ttk.Label(tb, foreground="gray")
+        self._base_lbl.pack(side="right", padx=8)
+        self._update_base_label()
 
         # ── Vertical pane ─────────────────────────────────────────────────────
         vp = ttk.PanedWindow(self, orient="vertical")
@@ -730,7 +895,7 @@ class App(tk.Tk):
             if self._running[k].poll() is not None:
                 del self._running[k]
 
-        self._devs = scan_devices(self._base)
+        self._devs = scan_devices(self._base, self._prefix)
         sel = self._sel_iid()
         self._tree.delete(*self._tree.get_children())
 
@@ -767,8 +932,31 @@ class App(tk.Tk):
 
     # ── Toolbar actions ───────────────────────────────────────────────────────
 
+    def _update_base_label(self) -> None:
+        self._base_lbl.configure(text="  Base: {}   Prefix: {}".format(
+            self._base, self._prefix))
+
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self, self._base, self._prefix, self._apply_settings)
+        self.wait_window(dlg)
+
+    def _apply_settings(self, base: Path, prefix: str) -> None:
+        self._base, self._prefix = base, prefix
+        self._update_base_label()
+        try:
+            save_config({"base": str(base), "prefix": prefix})
+        except OSError as exc:
+            messagebox.showwarning(
+                "Settings not saved",
+                "Applied for this session, but could not write {}:\n{}".format(
+                    CONFIG_PATH, exc))
+        self.log("Device folder: {}   Prefix: {}".format(base, prefix))
+        self.refresh()
+        self._on_select()
+
     def _new_device(self) -> None:
-        dlg = CreateDeviceDialog(self, self._base, self._catalog, self.log)
+        dlg = CreateDeviceDialog(self, self._base, self._prefix,
+                                 self._catalog, self.log)
         self.wait_window(dlg)
         self.refresh()
 
@@ -816,7 +1004,7 @@ class App(tk.Tk):
             env["BOOTROM"] = bootrom
 
         run_sh = d["path"] / "run.sh"
-        label  = "{name}  [{board}-{build}]".format(**d)
+        label  = "{device_name}  [{board}-{build}]".format(**d)
         self.log("Starting {}  •  QEMU={}".format(label, qemu))
 
         try:
@@ -824,6 +1012,10 @@ class App(tk.Tk):
                 ["bash", str(run_sh)],
                 cwd=str(d["path"]),
                 env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
             )
             self._running[iid] = proc
             self.refresh()
@@ -839,6 +1031,11 @@ class App(tk.Tk):
     def _wait_exit(
         self, iid: str, proc: subprocess.Popen, label: str
     ) -> None:
+        try:
+            for line in proc.stdout:        # run.sh / QEMU output -> Log panel
+                self.log(line.rstrip())
+        except Exception:
+            pass
         proc.wait()
         self._running.pop(iid, None)
         self.after(0, self.refresh)
@@ -873,17 +1070,37 @@ class App(tk.Tk):
         if not messagebox.askyesno(
             "Confirm delete",
             "Permanently delete:\n\n"
-            "  {name}  [{board}-{build}]\n"
+            "  {device_name}  [{board}-{build}]\n"
             "  {path}\n\n"
             "This cannot be undone.".format(**d),
         ):
             return
+        path = str(d["path"])
         try:
-            shutil.rmtree(str(d["path"]))
-            self.log("Deleted {}.".format(d["path"]))
-            self.refresh()
+            shutil.rmtree(path)
+        except PermissionError as exc:
+            # Devices created as root (m68ap / n45ap) are root-owned.
+            if not (shutil.which("pkexec") and messagebox.askyesno(
+                    "Permission denied",
+                    "Some files are owned by root:\n{}\n\n"
+                    "Retry with administrator privileges (pkexec)?".format(exc))):
+                messagebox.showerror("Delete error", str(exc))
+                self.refresh()
+                return
+            r = subprocess.run(["pkexec", "rm", "-rf", "--", path],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                messagebox.showerror(
+                    "Delete error", (r.stderr or "pkexec failed").strip())
+                self.refresh()
+                return
         except Exception as exc:
             messagebox.showerror("Delete error", str(exc))
+            self.refresh()
+            return
+        self.log("Deleted {}.".format(path))
+        self.refresh()
+        self._on_select()
 
     # ── Detail panel ──────────────────────────────────────────────────────────
 
@@ -905,7 +1122,7 @@ class App(tk.Tk):
                 "iOS          {}".format(d["ios_version"]),
                 "SoC          {}".format(dev.get("soc", "?")),
                 "QEMU -M      {}".format(dev.get("qemu_machine", "?")),
-                "Needs sudo   {}".format("Yes" if dev.get("needs_sudo") else "No"),
+                "Needs root   {}".format("Yes" if dev.get("needs_sudo") else "No"),
                 "Bootrom      {}".format(
                     "Required" if dev.get("needs_bootrom") else "Not required"),
                 "Status       {}".format(pid_str),
@@ -964,17 +1181,28 @@ Environment
 
 Examples
   python3 tools/manageFirm.py
-  python3 tools/manageFirm.py --base ~/ios-devices
+  python3 tools/manageFirm.py --base ~/ios-devices --prefix MY_
   QEMU=build/qemu-system-arm python3 tools/manageFirm.py
 """)
-    ap.add_argument("--base", default="/opt",
-                    help="Directory that holds DEV_* device folders  (default: /opt)")
+    ap.add_argument("--base", default=None,
+                    help="Directory that holds the device folders  (default: saved "
+                         "setting, else {})".format(DEFAULT_BASE))
+    ap.add_argument("--prefix", default=None,
+                    help="Device folder name prefix  (default: saved setting, "
+                         "else {})".format(DEFAULT_PREFIX))
     ap.add_argument("--catalog", default=str(DEFAULT_CAT),
                     help="Path to firmware-catalog.json  (default: {})".format(
                         DEFAULT_CAT))
     args = ap.parse_args()
 
-    base    = Path(args.base)
+    cfg     = load_config()
+    base    = Path(os.path.expanduser(
+        args.base or cfg.get("base") or DEFAULT_BASE))
+    prefix  = args.prefix or cfg.get("prefix") or DEFAULT_PREFIX
+    if not valid_prefix(prefix):
+        print("[warn] Invalid prefix {!r}; using {!r}.".format(
+            prefix, DEFAULT_PREFIX))
+        prefix = DEFAULT_PREFIX
     catalog = Path(args.catalog)
 
     if not base.exists():
@@ -986,7 +1214,7 @@ Examples
               "you can browse for it in the Create Device dialog.".format(
                   str(catalog)))
 
-    App(base, catalog).mainloop()
+    App(base, catalog, prefix).mainloop()
 
 
 if __name__ == "__main__":
