@@ -21,16 +21,16 @@ jobs:
       - name: Install dependencies
         # libssl-dev, libpixman-1-dev and libglib2.0-dev ship the static .a files
         # (libcrypto.a, libpixman-1.a, libglib-2.0.a) that --static links against.
-        # libpcre2-dev, libffi-dev and zlib1g-dev are glib's static dependencies;
-        # libmount-dev, libblkid-dev and libselinux1-dev are libgio's.
+        # libpcre2-dev, libffi-dev and zlib1g-dev are glib's static dependencies.
+        # libgio is disabled below: statically it needs libmount.a, which the
+        # Ubuntu packages do not ship.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential make ninja-build pkg-config \
             python3 python3-venv python3-pip git ccache \
             libssl-dev libpixman-1-dev libglib2.0-dev libslirp-dev libfdt-dev \
-            libpcre2-dev libffi-dev zlib1g-dev \
-            libmount-dev libblkid-dev libselinux1-dev
+            libpcre2-dev libffi-dev zlib1g-dev
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -43,7 +43,7 @@ jobs:
           mkdir build && cd build
           ../configure \
             --static --disable-pie \
-            --disable-sdl --disable-gtk \
+            --disable-sdl --disable-gtk --disable-gio \
             --enable-slirp --disable-cocoa \
             --target-list=arm-softmmu \
             --disable-capstone --disable-guest-agent \
