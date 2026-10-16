@@ -77,6 +77,8 @@ python3 tools/firmwarekit.py create [OPTIONS]
 - `--no-volume-edit`: Skip mount-and-edit step for `m68ap`/`n45ap` (useful for fast testing without root).
 - `--skip-activation`: Do not patch `lockdownd` on iPhone OS 1.x.
 - `--skip-sha1`, `--skip-sha1sum`: Skip checking the IPSW SHA-1 hash against the catalog entry. Useful for faster processing, testing slightly modified/re-packaged IPSWs, or when the hash in the catalog differs.
+- `--helper <path>`: Path to `it_keybag` guest helper binary (armv7) for iOS 4.x/5.x effaceable storage and system keybag provisioning. If not specified, automatically looks for `tools/it_keybag`, `build/ipad1-guest/it_keybag`, `contrib/it-keybag/it_keybag`, `build/it_keybag`, or `$IT_KEYBAG`.
+- `--skip-keybag`: Skip keybag provisioning on iOS 4.x/5.x (leaves blank `nor.bin`).
 
 ---
 
@@ -308,23 +310,60 @@ export QEMU=~/Documents/qemu-ios/build/qemu-system-arm
 - **QEMU Machine**: `-M iPhone-4`
 - **Requires Sudo**: No
 
-#### Creation Command (iOS 4.0)
+#### Data Protection & `it_keybag` Provisioning
+iOS 4.x and 5.x on the iPhone 4 require a writable NOR flash (`nor.bin`) containing formatted effaceable storage and the system keybag (`/private/var/keybags/systembag.kb`). Without this, the system will get stuck in a `keybagd` reboot loop (`keybagd: kb_load: ...`).
+
+1. **Obtain `it_keybag`**:
+   - Run the GitHub Actions workflow [`.github/workflows/build-guest-helpers.yml`](file:///home/pc/Documents/qemu-ios/.github/workflows/build-guest-helpers.yml) to compile `it_keybag` (armv7).
+   - Download the `it_keybag-armv7` artifact and save it to `tools/it_keybag`.
+   - Make it executable:
+     ```bash
+     chmod +x tools/it_keybag
+     ```
+   - `firmwarekit.py` will automatically detect `tools/it_keybag` (or you can explicitly pass `--helper tools/it_keybag`).
+
+#### Creating the FirmwareKit Folder (iOS 4.0 / 4.1 / 4.2.1)
+Run `firmwarekit.py create` pointing to your restore IPSW and catalog:
+
 ```bash
 python3 tools/firmwarekit.py create \
   --ipsw ~/Downloads/iPhone3,1_4.0_8A293_Restore.ipsw \
   --catalog iphone/firmware-catalog.json \
   --id n90ap-8A293 \
+  --helper tools/it_keybag \
   --out /opt/DEV_n90ap_8A293
 ```
 
+During creation, `firmwarekit.py` will:
+1. Extract the kernel cache, device tree, and ramdisk from the IPSW.
+2. Decrypt the RootFS DMG using catalog keys and convert it into YaFTL NAND flash pages.
+3. Patch `lockdownd` for offline activation and disable watchdogs.
+4. Automatically boot QEMU headlessly with the restore ramdisk and `it_keybag` to format effaceable storage in `nor.bin` and write the system keybag to `/private/var/keybags/systembag.kb` in the NAND store.
+5. Generate `kboot.bin` and the ready-to-run `run.sh` script.
+
+#### Resulting Folder Structure
+The destination folder (`/opt/DEV_n90ap_8A293`) will contain:
+- `kboot.bin`: Staged kernel, ramdisk, device tree, and boot arguments.
+- `nand/`: YaFTL NAND store containing MBR partition table, RootFS, and Data partition.
+- `nor.bin`: 1 MiB writable NOR flash with effaceable storage keys.
+- `identity.json`: Synthesized device parameters (serial number, ECID, IMEI, Wi-Fi MAC).
+- `run.sh`: Automated QEMU launch script with overlay cleanup.
+
 #### Other Verified Catalog IDs & IPSWs
+- **iOS 4.0.1**: `--id n90ap-8A306` (`iPhone3,1_4.0.1_8A306_Restore.ipsw`)
+- **iOS 4.0.2**: `--id n90ap-8A400` (`iPhone3,1_4.0.2_8A400_Restore.ipsw`)
 - **iOS 4.1**: `--id n90ap-8B117` (`iPhone3,1_4.1_8B117_Restore.ipsw`)
 - **iOS 4.2.1**: `--id n90ap-8C148` (`iPhone3,1_4.2.1_8C148_Restore.ipsw`)
 - **iOS 4.3.3**: `--id n90ap-8J2` (`iPhone3,1_4.3.3_8J2_Restore.ipsw`)
 - **iOS 5.1.1**: `--id n90ap-9B206` (`iPhone3,1_5.1.1_9B206_Restore.ipsw`)
 
-> [!NOTE]
-> **Data Protection & Keybag (iOS 4.x+)**: iOS 4+ requires writable NOR (`nor.bin`) and effaceable storage/system keybag (`/private/var/keybags/systembag.kb`). `firmwarekit.py` automatically generates a 1 MiB `nor.bin`, wires `nor-rw="$D/nor.bin"` into `run.sh`, and provisions the system keybag using the restore ramdisk when `--helper /path/to/it_keybag` (or `build/ipad1-guest/it_keybag`) is present. You can also provision an existing bundle via `python3 tools/firmwarekit.py provision-keybag /opt/DEV_n90ap_8B117 --ramdisk <restoreramdisk.dmg>`.
+> [!TIP]
+> **Provisioning an Existing Folder**: If you previously created an `n90ap` folder without `it_keybag` and have a blank `nor.bin`, you can provision the keybag at any time using:
+> ```bash
+> python3 tools/firmwarekit.py provision-keybag /opt/DEV_n90ap_8A293 \
+>   --ramdisk /path/to/decrypted-restore-ramdisk.dmg \
+>   --helper tools/it_keybag
+> ```
 
 #### Booting the Device
 ```bash

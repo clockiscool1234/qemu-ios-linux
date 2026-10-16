@@ -1948,6 +1948,7 @@ def create_kboot(args, entry, ipsw, ri, out, work):
                     os.path.join(ROOT, "build", "ipod-guest", "it_keybag"),
                     os.path.join(ROOT, "contrib", "it-keybag", "it_keybag"),
                     os.path.join(ROOT, "build", "it_keybag"),
+                    os.path.join(ROOT, "tools", "it_keybag"),
                 ]:
                     if os.path.isfile(cand):
                         helper = os.path.abspath(cand)
@@ -2163,6 +2164,7 @@ def cmd_provision_keybag(args):
             os.path.join(ROOT, "build", "ipod-guest", "it_keybag"),
             os.path.join(ROOT, "contrib", "it-keybag", "it_keybag"),
             os.path.join(ROOT, "build", "it_keybag"),
+            os.path.join(ROOT, "tools", "it_keybag"),
         ]:
             if os.path.isfile(cand):
                 helper = os.path.abspath(cand)

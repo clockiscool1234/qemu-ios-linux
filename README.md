@@ -80,6 +80,52 @@ every input and every staged file). LightTouchMac pins this repository by commit
 release build validates the staged tree against the manifest. Bump the pin when the guest tools, the
 helper ABI or the entitlements change.
 
+## Creating a device bundle (FirmwareKit)
+
+On Linux, `tools/firmwarekit.py` unpacks Apple stock restore IPSWs, decrypts system images, and generates bootable device folders with offline NAND stores, patched kernel caches, synthesized device identities, and `run.sh` scripts.
+
+```sh
+# System dependencies
+sudo apt-get install -y python3 hfsprogs libssl-dev
+```
+
+### Example: iPhone 4 GSM (`n90ap`)
+
+For A4 devices on iOS 4.x/5.x (iPhone 4 `n90ap`, iPad 1 `k48ap`, iPod touch 4G `n81ap`), iOS requires Data Protection keybag provisioning (`/private/var/keybags/systembag.kb` and a formatted NOR effaceable storage). Without this provisioning, the guest loops in `keybagd: kb_load`.
+
+1. **Obtain `it_keybag`**:
+   - Build the armv7 helper using GitHub Actions ([`.github/workflows/build-guest-helpers.yml`](file:///home/pc/Documents/qemu-ios/.github/workflows/build-guest-helpers.yml)) or via an Xcode/armv7 toolchain.
+   - Place the compiled binary at `tools/it_keybag` and ensure it is executable (`chmod +x tools/it_keybag`).
+   - `firmwarekit.py` automatically detects `tools/it_keybag` (or you can specify `--helper /path/to/it_keybag`).
+
+2. **Generate the device folder**:
+   ```sh
+   python3 tools/firmwarekit.py create \
+     --ipsw ~/Downloads/iPhone3,1_4.0_8A293_Restore.ipsw \
+     --catalog iphone/firmware-catalog.json \
+     --id n90ap-8A293 \
+     --helper tools/it_keybag \
+     --out /opt/DEV_n90ap_8A293
+   ```
+
+3. **Output bundle structure**:
+   The generated `/opt/DEV_n90ap_8A293` folder contains:
+   - `kboot.bin`: Direct kernel boot bundle (kernel cache, ramdisk, device tree, boot args).
+   - `nand/`: YaFTL NAND store containing MBR partition table, rootfs, and data partition.
+   - `nor.bin`: 1 MiB NOR image with formatted effaceable storage.
+   - `identity.json`: Synthesized device identity (serial number, ECID, IMEI, Wi-Fi MAC).
+   - `run.sh`: Automated QEMU launch script.
+
+4. **Booting the device**:
+   ```sh
+   cd /opt/DEV_n90ap_8A293
+   export QEMU=~/Documents/qemu-ios/build/qemu-system-arm
+   ./run.sh
+   ```
+
+For all other supported boards (iPhone 2G `m68ap`, iPod touch 1G/2G/3G/4G, iPad 1 `k48ap`, iPhone 3GS `n88ap`), options, and controls, see [tools/README.md](file:///home/pc/Documents/qemu-ios/tools/README.md).
+
+
 ## Gates
 
 One command, three tiers:
