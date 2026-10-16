@@ -1710,34 +1710,182 @@ def activate_lockdownd(data, allow_signed_era=True, resign=True):
 LOCKDOWND = "usr/libexec/lockdownd"
 
 
-def activate_volume(m, log=print):
-    """SystemEdits.activate: patch lockdownd in place on the mounted volume `m` (owner/mode kept)."""
-    path = os.path.join(m, LOCKDOWND)
-    with open(path, "rb") as f:
-        before = f.read()
-    if not before:
-        # The Linux hfsplus driver shows an HFS+-compressed file (UF_COMPRESSED + com.apple.decmpfs) as an
-        # empty data fork: the content lives in the decmpfs attribute / resource fork, which it cannot read.
-        try:
-            attrs = os.listxattr(path)
-        except OSError:
-            attrs = []
-        if any("decmpfs" in a for a in attrs):
-            raise ActivationError("%s is HFS+-compressed (data fork is empty, xattrs: %s); patching "
-                                  "compressed files is not supported" % (LOCKDOWND, ", ".join(attrs)))
-        raise ActivationError("%s reads as 0 bytes on the mounted volume (xattrs: %s)"
-                              % (LOCKDOWND, ", ".join(attrs) or "none"))
-    after, rep = activate_lockdownd(before)
-    mode = os.stat(path).st_mode & 0o7777
-    os.chmod(path, mode | 0o200)
+# --- HFS+ compression (decmpfs) -------------------------------------------------------------
+#
+# iOS 4.x rootfs files are stored HFS+-compressed: the data fork is empty, UF_COMPRESSED is set and
+# the bytes live in the com.apple.decmpfs xattr (type 3, small files) or in the resource fork
+# (type 4, everything bigger, including lockdownd).  The Linux hfsplus driver knows nothing about
+# that, so a plain read() of lockdownd returns 0 bytes.  These helpers rebuild the real contents.
+
+DECMPFS_XATTR = "osx.com.apple.decmpfs"
+RSRC_XATTR = "osx.com.apple.ResourceFork"
+
+
+def _getxattr(path, name):
     try:
-        with open(path, "r+b") as f:  # in place: the catalog record, owner and mode stay
+        return os.getxattr(path, name)
+    except (OSError, AttributeError):
+        return None
+
+
+def decmpfs_decode(hdr, rsrc=None):
+    """Contents of a decmpfs-compressed file from its com.apple.decmpfs attribute `hdr` and, for type 4,
+    its resource fork `rsrc` (a callable returning the bytes, or the bytes)."""
+    if len(hdr) < 16 or hdr[:4] != b"fpmc":
+        raise FirmwareError("com.apple.decmpfs attribute has a bad magic")
+    ctype, usize = struct.unpack_from("<IQ", hdr, 4)
+    if ctype in (1, 3):                       # 1: raw inline, 3: zlib inline (0xFF lead byte = stored)
+        body = hdr[16:]
+        if ctype == 1 or body[:1] == b"\xff":
+            out = body[1:] if ctype == 3 else body
+        else:
+            out = zlib.decompress(body)
+    elif ctype == 4:                          # zlib blocks of 64 KiB in the resource fork
+        fork = rsrc() if callable(rsrc) else rsrc
+        if not fork:
+            raise FirmwareError("decmpfs type 4 file but its resource fork could not be read")
+        base = struct.unpack_from(">I", fork, 0)[0]            # normally 0x100
+        nblocks = struct.unpack_from("<I", fork, base + 4)[0]
+        parts = []
+        for i in range(nblocks):
+            off, size = struct.unpack_from("<II", fork, base + 8 + 8 * i)
+            blk = fork[base + 4 + off: base + 4 + off + size]
+            parts.append(blk[1:] if blk[:1] == b"\xff" else zlib.decompress(blk))
+        out = b"".join(parts)
+    else:
+        raise FirmwareError("decmpfs compression type %d is not supported (only 1, 3, 4)" % ctype)
+    if len(out) != usize:
+        raise FirmwareError("decmpfs size mismatch: header says %d bytes, decoded %d" % (usize, len(out)))
+    return out
+
+
+def _fork_from_extents(f, bsize, fork):
+    """Bytes of an HFSPlusForkData `fork` read through its 8 inline extents."""
+    lsize, _clump, total = struct.unpack_from(">QII", fork, 0)
+    ext = [struct.unpack_from(">II", fork, 16 + 8 * i) for i in range(8)]
+    if sum(c for _s, c in ext) < total:
+        raise FirmwareError("fork needs extents-overflow records (fragmented), not supported")
+    out = bytearray()
+    for start, cnt in ext:
+        if not cnt:
+            break
+        f.seek(start * bsize)
+        out += f.read(cnt * bsize)
+    return bytes(out[:lsize])
+
+
+def _hfs_catalog_files(img):
+    """Parse the catalog of a raw HFS+ volume image: {path: (fileID, resource-fork bytes loader)}."""
+    with open(img, "rb") as f:
+        f.seek(1024)
+        vh = f.read(512)
+        if vh[:2] not in (b"H+", b"HX"):
+            raise FirmwareError("%s is not a raw HFS+ volume" % img)
+        bsize = struct.unpack_from(">I", vh, 40)[0]
+
+        def fork_bytes(fork):
+            return _fork_from_extents(f, bsize, fork)
+
+        cat = fork_bytes(vh[272:272 + 80])
+        nsize = struct.unpack_from(">H", cat, 32)[0]
+        node = struct.unpack_from(">I", cat, 24)[0]            # first leaf node
+        folders = {2: (1, "")}                                 # folderID -> (parent, name); 2 = root
+        files = []
+        while node:
+            nd = cat[node * nsize:(node + 1) * nsize]
+            flink, _blink, kind, _h, nrec = struct.unpack_from(">IIbBH", nd, 0)
+            if kind != -1:
+                raise FirmwareError("catalog leaf chain is corrupt")
+            for i in range(nrec):
+                off = struct.unpack_from(">H", nd, nsize - 2 * (i + 1))[0]
+                klen = struct.unpack_from(">H", nd, off)[0]
+                parent, nlen = struct.unpack_from(">IH", nd, off + 2)
+                name = nd[off + 8:off + 8 + 2 * nlen].decode("utf-16-be")
+                rec = off + 2 + klen
+                rec += rec & 1
+                rtype = struct.unpack_from(">h", nd, rec)[0]
+                if rtype == 1:
+                    folders[struct.unpack_from(">I", nd, rec + 8)[0]] = (parent, name)
+                elif rtype == 2:
+                    files.append((parent, name, struct.unpack_from(">I", nd, rec + 8)[0],
+                                  bytes(nd[rec + 168:rec + 248])))
+            node = flink
+
+        def pathof(parent, name):
+            parts = [name]
+            while parent > 2 and parent in folders:
+                parent, n = folders[parent]
+                parts.append(n)
+            return "/".join(reversed(parts))
+
+        found = {pathof(p, n): (fid, rfork) for p, n, fid, rfork in files}
+
+    def load(fk):
+        with open(img, "rb") as f2:
+            return _fork_from_extents(f2, bsize, fk)
+    return found, load
+
+
+def read_hfs_file(m, relpath, image=None):
+    """Bytes of `relpath` on the mounted volume `m`, undoing HFS+ compression.  `image` is the raw volume
+    behind the mount; it is only needed to fetch a resource fork the kernel driver does not expose."""
+    path = os.path.join(m, relpath)
+    with open(path, "rb") as f:
+        data = f.read()
+    hdr = _getxattr(path, DECMPFS_XATTR)
+    if hdr is None:
+        return data, False
+    if data:
+        return data, False                    # compressed flag left on a file that has a data fork: trust it
+
+    def rsrc():
+        got = _getxattr(path, RSRC_XATTR)
+        if got:
+            return got
+        if not image:
+            return None
+        subprocess.run(["sync"])
+        files, load = _hfs_catalog_files(image)
+        ent = files.get(relpath)
+        return load(ent[1]) if ent else None
+    return decmpfs_decode(hdr, rsrc), True
+
+
+def activate_volume(m, log=print, image=None):
+    """SystemEdits.activate: patch lockdownd on the mounted volume `m` (owner/mode kept).  A decmpfs-compressed
+    lockdownd (iOS 4.x) is decompressed and rewritten as a plain file; `image` is the raw volume behind `m`."""
+    path = os.path.join(m, LOCKDOWND)
+    before, compressed = read_hfs_file(m, LOCKDOWND, image)
+    if not before:
+        raise ActivationError("%s reads as 0 bytes on the volume and has no decmpfs data" % LOCKDOWND)
+    after, rep = activate_lockdownd(before)
+    st = os.stat(path)
+    mode = st.st_mode & 0o7777
+    if compressed:
+        # Replace, don't overwrite: the stock file carries UF_COMPRESSED + com.apple.decmpfs, and iOS would keep
+        # reading the old bytes from that attribute.  A fresh file is plain and uncompressed.
+        tmp = path + ".new"
+        with open(tmp, "wb") as f:
             f.write(after)
-    finally:
-        os.chmod(path, mode)
-    log("activation: %s at file offset 0x%x (%s): %s -> %s%s" % (
+        os.chmod(tmp, mode)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except (PermissionError, AttributeError):
+            pass
+        os.unlink(path)
+        os.rename(tmp, path)
+        rep["decompressed"] = True
+    else:
+        os.chmod(path, mode | 0o200)
+        try:
+            with open(path, "r+b") as f:  # in place: the catalog record, owner and mode stay
+                f.write(after)
+        finally:
+            os.chmod(path, mode)
+    log("activation: %s at file offset 0x%x (%s): %s -> %s%s%s" % (
         rep["strategy"], rep["offset"], rep["isa"], rep["original"], rep["replacement"],
-        " (re-signed ad hoc)" if rep.get("resigned") else ""))
+        " (re-signed ad hoc)" if rep.get("resigned") else "",
+        " (was HFS+-compressed, rewritten as a plain file)" if rep.get("decompressed") else ""))
     return rep
 
 
@@ -2059,7 +2207,7 @@ def activate_kboot_rootfs(system_img, work, log=print):
     mnt = os.path.join(work, "mnt_sys")
     print("activating lockdownd in the rootfs...")
     try:
-        rep = with_mounted(system_img, mnt, lambda m: activate_volume(m, log))
+        rep = with_mounted(system_img, mnt, lambda m: activate_volume(m, log, image=system_img))
         print("  lockdownd: %s -> %s" % (rep["input_sha256"][:12], rep["output_sha256"][:12]))
         return rep
     except ActivationError as e:
