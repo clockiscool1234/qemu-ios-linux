@@ -1,4 +1,4 @@
-# NOTE: this will soon be replaced, so do not follow these instructructions
+# NOTE: this will soon be replaced, so do not follow these instructions
 
 ## Running the iPod Touch 2G Emulator
 
