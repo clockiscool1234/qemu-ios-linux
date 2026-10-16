@@ -22,6 +22,9 @@ Usage:
 
 Outputs in --out:  iBoot.bin  nor.bin  nand/  identity.json  run.sh
 
+Boards that boot through a bootrom (m68ap, n45ap, n72ap) take `--bootrom PATH`: the file is copied into
+--out (as bootrom_<soc>) and run.sh uses that copy, so no $BOOTROM is needed to run the device.
+
 NOT ported from Swift: guest package / GL hook, SystemConfiguration (Wi-Fi/proxy) seeding,
 HFS+ journaling, catalog date normalisation, re-signing of signed-era lockdownd, IMG3 decryption
 (n72/n88/k48/n81/n90 need decryption keys from the catalog; those boards produce a stub run.sh).
@@ -1636,9 +1639,53 @@ BOARD_META = {
 }
 
 
-def _run_sh_header(out_var="$D"):
-    """Common shell preamble: locate the script directory."""
-    return 'D=$(cd "$(dirname \'$0\')" && pwd)\n'
+# board -> (SoC, file name the bootrom gets inside the device folder).  Only boards that boot through
+# a bootrom are listed; the kboot boards (n18/n88/k48/n81/n90) start the kernel directly.
+BOOTROMS = {
+    "m68ap": ("S5L8900", "bootrom_s5l8900"),
+    "n45ap": ("S5L8900", "bootrom_s5l8900"),
+    "n72ap": ("S5L8720", "bootrom_s5l8720"),
+}
+
+# Shell line that sets D to the directory holding run.sh (works from any cwd, through symlinks-free paths).
+SH_DIR_LINE = 'D=$(cd "$(dirname "$0")" && pwd)\n'
+
+
+def resolve_bootrom(board, path):
+    """The --bootrom argument -> absolute path (or None when not given / not used by this board)."""
+    if not path:
+        return None
+    if board not in BOOTROMS:
+        print("note: %s boots without a bootrom; ignoring --bootrom" % board)
+        return None
+    full = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(full):
+        raise FirmwareError("bootrom %s not found (or not a file)" % full)
+    if os.path.getsize(full) == 0:
+        raise FirmwareError("bootrom %s is empty" % full)
+    return full
+
+
+def install_bootrom(src, board, out):
+    """Copy the user's bootrom into the device folder under its canonical name -> that name."""
+    soc, name = BOOTROMS[board]
+    dst = os.path.join(out, name)
+    if not (os.path.exists(dst) and os.path.samefile(src, dst)):
+        shutil.copyfile(src, dst)
+    os.chmod(dst, 0o644)
+    print("bootrom %s -> %s (%s)" % (src, name, soc))
+    return name
+
+
+def bootrom_guard(board):
+    """run.sh lines choosing the bootrom: the copy bundled next to run.sh wins, else $BOOTROM."""
+    soc, name = BOOTROMS[board]
+    return (
+        '[ -f "$D/%s" ] && BOOTROM="$D/%s"\n'
+        '[ -n "$BOOTROM" ] || { echo "no bootrom: re-run firmwarekit create with --bootrom, '
+        'or put the %s bootrom at $D/%s, or set BOOTROM"; exit 1; }\n'
+        '[ -f "$BOOTROM" ] || { echo "bootrom not found: $BOOTROM"; exit 1; }\n'
+    ) % (name, name, soc, name)
 
 
 def _write_run_sh(path, body):
@@ -1747,14 +1794,17 @@ def create_img2(args, entry, ipsw, ri, out, work):
         except OSError:
             pass
 
-    # bootrom is the S5L8900; it is external
-    bootrom_env = {"m68ap": "S5L8900", "n45ap": "S5L8900"}.get(board, "BOOTROM")
+    # the bootrom: the user's copy goes into the device folder, run.sh prefers it
+    if args.bootrom_path:
+        install_bootrom(args.bootrom_path, board, out)
+    else:
+        print("note: no --bootrom given; run.sh will need $BOOTROM (or %s in this folder)" % BOOTROMS[board][1])
     imei_str = ident.get("imei", "")
     wifi_str = ident.get("wifi-mac", "")
-    run_body = 'D=$(cd "$(dirname \'$0\')" && pwd)\n'
+    run_body = SH_DIR_LINE
     run_body += _cleanup_trap(tmp_prefix)
-    run_body += """[ -n "$BOOTROM" ] || { echo "set BOOTROM to the %s bootrom"; exit 1; }
-mkdir -p /tmp/%s-ovl
+    run_body += bootrom_guard(board)
+    run_body += """mkdir -p /tmp/%s-ovl
 cp -n "$D/nor.bin" /tmp/%s-nor.bin
 chmod u+w /tmp/%s-nor.bin
 exec ${QEMU:-qemu-system-arm} \\
@@ -1762,18 +1812,16 @@ exec ${QEMU:-qemu-system-arm} \\
   -drive if=pflash,format=raw,file=/tmp/%s-nor.bin \\
   -serial mon:stdio -display sdl,show-cursor=on -audio driver=none \\
   -qmp unix:/tmp/%s-qmp.sock,server,nowait
-""" % (bootrom_env, tmp_prefix, tmp_prefix, tmp_prefix,
+""" % (tmp_prefix, tmp_prefix, tmp_prefix,
        qemu_machine, tmp_prefix, imei_str, wifi_str,
        tmp_prefix, tmp_prefix)
     _write_run_sh(os.path.join(out, "run.sh"), run_body)
 
-    bootrom_name = "bootrom_s5l8900"
     print("""
 done: %s
 Not done (the Swift firmwarekit handles these): guest package / OpenGLES hook, Wi-Fi + proxy
-SystemConfiguration seeding, HFS+ journaling, catalog date normalisation.
-Supply the %s bootrom (%s) via $BOOTROM."""
-          % (out, board, bootrom_name))
+SystemConfiguration seeding, HFS+ journaling, catalog date normalisation."""
+          % out)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1822,10 +1870,14 @@ def create_img3(args, entry, ipsw, ri, out, work):
         json.dump(ident, f, indent=1)
 
     # run.sh: n72 uses a pre-built nor.bin and nand/ from the release
-    run_body = 'D=$(cd "$(dirname \'$0\')" && pwd)\n'
+    if args.bootrom_path:
+        install_bootrom(args.bootrom_path, board, out)
+    else:
+        print("note: no --bootrom given; run.sh will need $BOOTROM (or %s in this folder)" % BOOTROMS[board][1])
+    run_body = SH_DIR_LINE
     run_body += _cleanup_trap(tmp_prefix)
-    run_body += """[ -n "$BOOTROM" ] || { echo "set BOOTROM to the S5L8720 bootrom"; exit 1; }
-exec ${QEMU:-qemu-system-arm} \\
+    run_body += bootrom_guard(board)
+    run_body += """exec ${QEMU:-qemu-system-arm} \\
   -M %s,bootrom=$BOOTROM,nand="$D/nand",nor="$D/nor.bin" \\
   -serial mon:stdio -display sdl,show-cursor=on -audio driver=none
 """ % qemu_machine
@@ -1833,8 +1885,7 @@ exec ${QEMU:-qemu-system-arm} \\
     print("""
 done: %s
 n72ap requires IMG3 decryption keys (from the catalog's 'keys' section) to build a working NOR.
-The raw encrypted img3s are in img3/. See the Swift FirmwareKit (N72NOR.swift) for the NOR layout.
-Supply the S5L8720 bootrom via $BOOTROM.""" % out)
+The raw encrypted img3s are in img3/. See the Swift FirmwareKit (N72NOR.swift) for the NOR layout.""" % out)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1983,7 +2034,7 @@ def create_kboot(args, entry, ipsw, ri, out, work):
                     print("note: decrypted restore ramdisk not found; blank nor.bin created.")
 
     # 7. Generate run.sh
-    run_body = 'D=$(cd "$(dirname \'$0\')" && pwd)\n'
+    run_body = SH_DIR_LINE
     run_body += _cleanup_trap(tmp_prefix)
     nor_arg = ',nor-rw="$D/nor.bin"' if writable_nor else ""
     run_body += """mkdir -p /tmp/%s-ovl
@@ -2226,6 +2277,7 @@ def create(args):
     if board not in _BOARD_CREATORS:
         raise FirmwareError("%s has board '%s'; supported boards: %s"
                             % (args.id, board, ", ".join(sorted(_BOARD_CREATORS))))
+    args.bootrom_path = resolve_bootrom(board, getattr(args, "bootrom", None))
     src = entry["source"]
     ipsw_path = args.ipsw
     if not os.path.exists(ipsw_path):
@@ -2734,6 +2786,69 @@ def selftest(_args):
         except ActivationError as e:
             check("activation: refuses a signed lockdownd (no re-signing here)", "signature" in str(e), str(e))
 
+    # bootrom bundling: resolve, copy into the device folder, run.sh prefers the copy from any cwd
+    d = tempfile.mkdtemp(prefix="bootrom-selftest-")
+    try:
+        src = os.path.join(d, "my dump.bin")
+        open(src, "wb").write(b"ROM" * 100)
+        check("resolve_bootrom: None when not given", resolve_bootrom("m68ap", None) is None)
+        check("resolve_bootrom: kboot boards ignore it", resolve_bootrom("n88ap", src) is None)
+        check("resolve_bootrom: absolute path for a real file", resolve_bootrom("n72ap", src) == src)
+        for bad in (os.path.join(d, "missing"), d):
+            try:
+                resolve_bootrom("m68ap", bad)
+                check("resolve_bootrom refuses %s" % os.path.basename(bad), False)
+            except FirmwareError:
+                check("resolve_bootrom refuses %s" % os.path.basename(bad), True)
+        open(os.path.join(d, "empty"), "wb").close()
+        try:
+            resolve_bootrom("m68ap", os.path.join(d, "empty"))
+            check("resolve_bootrom refuses an empty file", False)
+        except FirmwareError:
+            check("resolve_bootrom refuses an empty file", True)
+        dev = os.path.join(d, "DEV")
+        os.makedirs(dev)
+        check("install_bootrom copies under the canonical name",
+              install_bootrom(src, "n45ap", dev) == "bootrom_s5l8900"
+              and open(os.path.join(dev, "bootrom_s5l8900"), "rb").read() == b"ROM" * 100)
+        check("install_bootrom is idempotent on its own copy",
+              install_bootrom(os.path.join(dev, "bootrom_s5l8900"), "n45ap", dev) == "bootrom_s5l8900")
+        sh = os.path.join(dev, "run.sh")
+        _write_run_sh(sh, SH_DIR_LINE + bootrom_guard("n45ap") + 'echo "$BOOTROM"\n')
+        env = {k: v for k, v in os.environ.items() if k != "BOOTROM"}
+        r = subprocess.run(["sh", sh], cwd="/", capture_output=True, text=True, env=env)
+        check("run.sh (run from /) uses the bundled bootrom", r.stdout.strip() == os.path.join(dev, "bootrom_s5l8900"), r.stdout + r.stderr)
+        env["BOOTROM"] = "/elsewhere/other"
+        r = subprocess.run(["sh", sh], cwd="/", capture_output=True, text=True, env=env)
+        check("run.sh: the bundled bootrom beats a stale $BOOTROM", r.stdout.strip() == os.path.join(dev, "bootrom_s5l8900"), r.stdout)
+        os.remove(os.path.join(dev, "bootrom_s5l8900"))
+        r = subprocess.run(["sh", sh], cwd="/", capture_output=True, text=True, env=env)
+        check("run.sh: falls back to $BOOTROM, complains if it is missing", r.returncode == 1 and "bootrom not found" in r.stdout, r.stdout)
+        del env["BOOTROM"]
+        r = subprocess.run(["sh", sh], cwd="/", capture_output=True, text=True, env=env)
+        check("run.sh: no bootrom anywhere -> clear error", r.returncode == 1 and "--bootrom" in r.stdout, r.stdout)
+
+        # create_img3 end to end on a fake IPSW (writes run.sh, copies the bootrom)
+        class FakeIPSW:
+            def names(self):
+                return ["Firmware/all_flash/all_flash.n72ap.production/iBoot.n72ap.RELEASE.img3"]
+            def read(self, n):
+                return b"x"
+        class A: pass
+        a = A()
+        a.seed, a.id, a.wifi_mac, a.bootrom_path = None, "n72ap-test", None, src
+        out = os.path.join(d, "n72")
+        os.makedirs(out)
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            create_img3(a, {"recipe": {}}, FakeIPSW(), {"board": "n72ap", "kernelcache": None}, out, d)
+        runsh = open(os.path.join(out, "run.sh")).read()
+        check("n72ap bundle: bootrom_s5l8720 copied, run.sh guards on it",
+              open(os.path.join(out, "bootrom_s5l8720"), "rb").read() == b"ROM" * 100
+              and "bootrom_s5l8720" in runsh and "-M iPod-Touch,bootrom=$BOOTROM" in runsh and SH_DIR_LINE in runsh)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     print("\nALL OK" if ok else "\nFAILURES")
     return 0 if ok else 1
 
@@ -2763,6 +2878,9 @@ def main():
                    help="leave lockdownd unpatched (m68ap/n45ap 1.x only)")
     c.add_argument("--skip-sha1", "--skip-sha1sum", dest="skip_sha1", action="store_true",
                    help="skip checking the IPSW SHA-1 hash against the catalog")
+    c.add_argument("--bootrom", metavar="PATH",
+                   help="bootrom file for boards that boot through one (m68ap/n45ap: S5L8900, n72ap: S5L8720); "
+                        "copied into --out as bootrom_<soc> and used by run.sh. Ignored for the other boards")
     c.add_argument("--qemu", help="path to qemu-system-arm binary")
     c.add_argument("--helper", help="path to it_keybag binary for iOS 4.x keybag provisioning")
     c.add_argument("--skip-keybag", action="store_true",

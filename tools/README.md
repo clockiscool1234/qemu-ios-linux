@@ -51,7 +51,7 @@ sudo apt-get install -y python3 hfsprogs libssl-dev
 ```
 
 - **Root / `sudo` Privileges**: Required when generating images for `m68ap` (iPhone 2G) and `n45ap` (iPod Touch 1G). The tool decrypts the system DMG, grows the HFS+ volume, mounts it via a loop device to patch `fstab`, disable watchdog daemons, and inject the activation bypass into `lockdownd`.
-- **Bootrom Files**: Place the raw SoC bootrom dump in a known directory (e.g. `~/bootroms/`). The runner script expects the environment variable `BOOTROM` pointing to the file.
+- **Bootrom Files** (`m68ap`, `n45ap`, `n72ap` only): pass the raw SoC bootrom dump with `--bootrom <path>`. It is copied into the device folder (`bootrom_s5l8900` / `bootrom_s5l8720`) and `run.sh` uses that copy, so the device folder is self-contained and `$BOOTROM` is not needed. Without `--bootrom`, `run.sh` falls back to `$BOOTROM`.
 
 ---
 
@@ -77,6 +77,7 @@ python3 tools/firmwarekit.py create [OPTIONS]
 - `--no-volume-edit`: Skip mount-and-edit step for `m68ap`/`n45ap` (useful for fast testing without root).
 - `--skip-activation`: Do not patch `lockdownd` on iPhone OS 1.x.
 - `--skip-sha1`, `--skip-sha1sum`: Skip checking the IPSW SHA-1 hash against the catalog entry. Useful for faster processing, testing slightly modified/re-packaged IPSWs, or when the hash in the catalog differs.
+- `--bootrom <path>`: Bootrom for boards that boot through one (`m68ap`/`n45ap`: S5L8900, `n72ap`: S5L8720). Copied into `--out` as `bootrom_<soc>`; `run.sh` prefers that copy over `$BOOTROM`. Ignored (with a note) for boards that boot via kboot.
 - `--helper <path>`: Path to `it_keybag` guest helper binary (armv7) for iOS 4.x/5.x effaceable storage and system keybag provisioning. If not specified, automatically looks for `tools/it_keybag`, `build/ipad1-guest/it_keybag`, `contrib/it-keybag/it_keybag`, `build/it_keybag`, or `$IT_KEYBAG`.
 - `--skip-keybag`: Skip keybag provisioning on iOS 4.x/5.x (leaves blank `nor.bin`).
 
@@ -97,6 +98,7 @@ sudo python3 tools/firmwarekit.py create \
   --ipsw ~/Downloads/iPhone1,1_1.0_1A543a_Restore.ipsw \
   --catalog iphone/firmware-catalog.json \
   --id m68ap-1A543a \
+  --bootrom ~/bootroms/bootrom_s5l8900 \
   --out /opt/DEV_m68ap_1A543a
 ```
 
@@ -109,7 +111,6 @@ sudo python3 tools/firmwarekit.py create \
 #### Booting the Device
 ```bash
 cd /opt/DEV_m68ap_1A543a
-export BOOTROM=~/bootroms/bootrom_s5l8900
 export QEMU=~/Documents/qemu-ios/build/qemu-system-arm
 ./run.sh
 ```
@@ -129,6 +130,7 @@ sudo python3 tools/firmwarekit.py create \
   --ipsw ~/Downloads/iPod1,1_1.1_3A101a_Restore.ipsw \
   --catalog iphone/firmware-catalog.json \
   --id n45ap-3A101a \
+  --bootrom ~/bootroms/bootrom_s5l8900 \
   --out /opt/DEV_n45ap_3A101a
 ```
 
@@ -141,7 +143,6 @@ sudo python3 tools/firmwarekit.py create \
 #### Booting the Device
 ```bash
 cd /opt/DEV_n45ap_3A101a
-export BOOTROM=~/bootroms/bootrom_s5l8900
 export QEMU=~/Documents/qemu-ios/build/qemu-system-arm
 ./run.sh
 ```
@@ -161,6 +162,7 @@ python3 tools/firmwarekit.py create \
   --ipsw ~/Downloads/iPod2,1_2.1.1_5F138_Restore.ipsw \
   --catalog iphone/firmware-catalog.json \
   --id n72ap-5F138 \
+  --bootrom ~/bootroms/bootrom_s5l8720 \
   --out /opt/DEV_n72ap_5F138
 ```
 
@@ -173,7 +175,6 @@ python3 tools/firmwarekit.py create \
 #### Booting the Device
 ```bash
 cd /opt/DEV_n72ap_5F138
-export BOOTROM=~/bootroms/bootrom_s5l8720
 export QEMU=~/Documents/qemu-ios/build/qemu-system-arm
 ./run.sh
 ```

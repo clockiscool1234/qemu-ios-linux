@@ -7,6 +7,8 @@ Device folders are named <prefix><board>_<build> (default prefix "DEV_").  The b
 directory and the prefix can be changed from the Settings button (saved to
 ~/.config/qemu-ios/manageFirm.json) or overridden with --base / --prefix.
   •  Create devices using tools/firmwarekit.py, with optional IPSW auto-download
+     (progress bar; uses aria2c -x16 -s16 when installed) and the chosen bootrom
+     copied into the device folder
   •  Start / stop QEMU for a device via its generated run.sh
   •  Delete device folders
 
@@ -15,7 +17,8 @@ Usage:
 
 Environment:
     QEMU     Path to qemu-system-arm  (auto-detected from build/ or PATH if unset)
-    BOOTROM  Path to bootrom file     (required only for m68ap / n45ap; prompted on first start)
+    BOOTROM  Path to bootrom file     (only for devices created without a bundled bootrom;
+                                       m68ap / n45ap / n72ap bundle the one picked at creation)
 
 Requirements:
     Python >= 3.8, tkinter (ships with Python on most Linux distros)
@@ -31,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
@@ -206,24 +210,112 @@ def fetch_ipsw_download_url(product: str, build: str) -> Optional[str]:
         return None
 
 
-def download_url_to_file(
-    url: str,
-    dest: Path,
-    on_progress: Optional[Callable] = None,
-) -> None:
+class DownloadCancelled(Exception):
+    pass
+
+
+# aria2c's console readout:  [#a1b2c3 1.2MiB/100MiB(1%) CN:16 DL:2.3MiB ETA:42s]
+_ARIA_PCT = re.compile(r"\((\d+)%\)")
+_ARIA_DL  = re.compile(r"DL:(\S+?)[\s\]]")
+_ARIA_ETA = re.compile(r"ETA:(\S+?)[\s\]]")
+
+
+def _download_aria2(aria2: str, url: str, part: Path,
+                    on_progress, should_stop, on_proc) -> bool:
+    """Download with aria2c (16 connections, 16 splits).  True on success."""
+    cmd = [aria2, "-x16", "-s16", "-k1M", "-c",
+           "--file-allocation=none", "--auto-file-renaming=false",
+           "--allow-overwrite=true", "--summary-interval=0",
+           "--console-log-level=warn", "--download-result=hide",
+           "--user-agent=" + _UA,
+           "-d", str(part.parent), "-o", part.name, url]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, errors="replace")
+    if on_proc:
+        on_proc(proc)
+    tail: list = []
+    for line in proc.stdout:            # aria2c redraws one line with \r
+        if should_stop and should_stop():
+            proc.terminate()
+            break
+        m = _ARIA_PCT.search(line)
+        if m:
+            if on_progress:
+                note = []
+                dl, eta = _ARIA_DL.search(line), _ARIA_ETA.search(line)
+                if dl:
+                    note.append(dl.group(1) + "/s")
+                if eta:
+                    note.append("ETA " + eta.group(1))
+                on_progress(int(m.group(1)), 100, "  ".join(note))
+        elif line.strip():
+            tail = (tail + [line.strip()])[-5:]
+    proc.wait()
+    if on_proc:
+        on_proc(None)
+    if should_stop and should_stop():
+        raise DownloadCancelled()
+    if proc.returncode != 0:
+        if on_progress:
+            on_progress(None, None, "aria2c failed (exit {}): {}".format(
+                proc.returncode, " | ".join(tail) or "no output"))
+        return False
+    if on_progress and part.exists():
+        on_progress(100, 100, "")
+    return part.exists()
+
+
+def _download_urllib(url: str, part: Path, on_progress, should_stop) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     with urllib.request.urlopen(req, timeout=120) as resp:
         total = int(resp.headers.get("Content-Length", 0))
         done  = 0
-        with open(str(dest), "wb") as fh:
+        last  = 0.0
+        with open(str(part), "wb") as fh:
             while True:
+                if should_stop and should_stop():
+                    raise DownloadCancelled()
                 chunk = resp.read(1 << 20)  # 1 MiB
                 if not chunk:
                     break
                 fh.write(chunk)
                 done += len(chunk)
-                if on_progress:
-                    on_progress(done, total)
+                now = time.monotonic()
+                if on_progress and now - last >= 0.1:
+                    last = now
+                    on_progress(done, total, "")
+        if on_progress:
+            on_progress(done, total, "")        # final value (not throttled)
+
+
+def download_url_to_file(
+    url: str,
+    dest: Path,
+    on_progress: Optional[Callable] = None,
+    should_stop: Optional[Callable] = None,
+    on_proc: Optional[Callable] = None,
+) -> str:
+    """Download url to dest (written as dest.part, renamed when complete).
+
+    Uses ``aria2c -x16 -s16`` when it is installed (falling back to urllib if
+    it fails), else urllib.  on_progress(done, total, note) is called as the
+    download advances: bytes for urllib; a percentage out of 100 for aria2c;
+    (None, None, message) reports a non-fatal problem.  Returns the tool used.
+    """
+    part = dest.with_name(dest.name + ".part")
+    aria2 = shutil.which("aria2c")
+    tool = "urllib"
+    if aria2 and _download_aria2(aria2, url, part, on_progress, should_stop, on_proc):
+        tool = "aria2c"
+    else:
+        for leftover in (part, part.with_name(part.name + ".aria2")):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        _download_urllib(url, part, on_progress, should_stop)
+    os.replace(str(part), str(dest))
+    return tool
 
 
 def load_config() -> dict:
@@ -324,6 +416,8 @@ class CreateDeviceDialog(tk.Toplevel):
         self._catalog = catalog
         self._log     = log_fn
         self._proc    = None
+        self._dl_proc = None      # aria2c, while downloading
+        self._closed  = False
         self._board_keys = list(DEVICES.keys())
         self._build_keys = []
 
@@ -464,8 +558,8 @@ class CreateDeviceDialog(tk.Toplevel):
         self._bootrom_entry.configure(state=br_state)
         self._bootrom_brow.configure(state=br_state)
         self._bootrom_hint.configure(
-            text="Required for this board" if needs_br
-                 else "Not required for this board",
+            text="Required for this board (copied into the device folder)"
+                 if needs_br else "Not required for this board",
             foreground="red" if needs_br else "gray",
         )
         self._refresh_out()
@@ -522,13 +616,21 @@ class CreateDeviceDialog(tk.Toplevel):
         except (tk.TclError, RuntimeError):
             pass
 
-    def _set_status(self, msg: str, busy: bool = False) -> None:
+    def _set_status(self, msg: str, busy: bool = False,
+                    pct: Optional[float] = None) -> None:
+        """busy -> spinning bar; pct (0-100) -> filled bar; neither -> idle."""
         def _do():
             self._status_var.set(msg)
-            if busy:
+            self._pbar.stop()
+            if pct is not None:
+                self._pbar.configure(mode="determinate", maximum=100)
+                self._pbar["value"] = pct
+            elif busy:
+                self._pbar.configure(mode="indeterminate")
                 self._pbar.start(10)
             else:
-                self._pbar.stop()
+                self._pbar.configure(mode="determinate", maximum=100)
+                self._pbar["value"] = 0
         self._ui(_do)
 
     # ── create flow ──────────────────────────────────────────────────────────
@@ -550,11 +652,18 @@ class CreateDeviceDialog(tk.Toplevel):
                 "firmware-catalog.json not found.\n"
                 "Browse for it in the Catalog JSON field.", parent=self)
             return
-        if dev.get("needs_bootrom") and not self._bootrom_var.get().strip():
-            messagebox.showwarning("Missing bootrom",
-                                   "This board requires a bootrom file.",
-                                   parent=self)
-            return
+        if dev.get("needs_bootrom"):
+            br = self._bootrom_var.get().strip()
+            if not br:
+                messagebox.showwarning("Missing bootrom",
+                                       "This board requires a bootrom file.",
+                                       parent=self)
+                return
+            if not Path(os.path.expanduser(br)).is_file():
+                messagebox.showwarning("Missing bootrom",
+                                       "Bootrom file not found:\n{}".format(br),
+                                       parent=self)
+                return
 
         self._create_btn.configure(state="disabled")
 
@@ -596,22 +705,39 @@ class CreateDeviceDialog(tk.Toplevel):
         dest  = Path("/tmp") / fname
 
         if not dest.exists():
-            def _progress(done: int, total: int) -> None:
+            def _progress(done, total, note="") -> None:
+                if done is None:            # non-fatal problem (aria2c failed)
+                    self._log(note + " -- falling back to urllib")
+                    return
                 if total:
-                    pct = "{}%".format(done * 100 // total)
-                else:
-                    pct = "{} MiB".format(done // (1 << 20))
-                self._set_status(
-                    "Downloading {}… {}".format(fname, pct), busy=True)
+                    pct = done * 100 / total
+                    msg = "Downloading {}…  {:.0f}%".format(fname, pct)
+                    if total != 100:        # urllib: byte counts
+                        msg += "  ({} / {} MiB)".format(
+                            done >> 20, total >> 20)
+                    if note:
+                        msg += "  " + note
+                    self._set_status(msg, pct=pct)
+                else:                       # size unknown
+                    self._set_status(
+                        "Downloading {}… {} MiB".format(fname, done >> 20),
+                        busy=True)
 
+            def _set_dl_proc(p) -> None:
+                self._dl_proc = p
+
+            tool = "aria2c -x16 -s16" if shutil.which("aria2c") else "urllib"
+            self._log("Downloading {} with {}".format(fname, tool))
+            self._set_status("Downloading {}…  0%".format(fname), pct=0)
             try:
-                download_url_to_file(dl_url, dest, _progress)
+                download_url_to_file(dl_url, dest, _progress,
+                                     should_stop=lambda: self._closed,
+                                     on_proc=_set_dl_proc)
+            except DownloadCancelled:
+                self._log("Download cancelled.")
+                return
             except Exception as exc:
                 self._set_status("Download error: {}".format(exc))
-                try:
-                    dest.unlink()
-                except OSError:
-                    pass
                 self._ui(lambda: self._create_btn.configure(state="normal"))
                 return
 
@@ -649,8 +775,9 @@ class CreateDeviceDialog(tk.Toplevel):
         bootrom = self._bootrom_var.get().strip()
         if seed:
             cmd += ["--seed", seed]
-        if bootrom:
-            os.environ["BOOTROM"] = os.path.abspath(os.path.expanduser(bootrom))
+        if bootrom and dev.get("needs_bootrom"):
+            # firmwarekit copies it into the device folder; run.sh uses that copy
+            cmd += ["--bootrom", os.path.abspath(os.path.expanduser(bootrom))]
         if dev.get("needs_sudo"):
             cmd = self._as_root(cmd)
 
@@ -684,6 +811,15 @@ class CreateDeviceDialog(tk.Toplevel):
     # ── close ────────────────────────────────────────────────────────────────
 
     def _close(self) -> None:
+        dl = self._dl_proc
+        if dl and dl.poll() is None:
+            if not messagebox.askyesno(
+                "Download in progress",
+                "The IPSW is still downloading.  Cancel it?", parent=self):
+                return
+        self._closed = True            # stops the download thread
+        if dl and dl.poll() is None:
+            dl.terminate()
         if self._proc and self._proc.poll() is None:
             if not messagebox.askyesno(
                 "In progress",
@@ -994,7 +1130,11 @@ class App(tk.Tk):
 
         # Bootrom (m68ap / n45ap only)
         dev_meta = DEVICES.get(d["board"], {})
-        if dev_meta.get("needs_bootrom"):
+        bundled = sorted(d["path"].glob("bootrom_*"))
+        if dev_meta.get("needs_bootrom") and bundled:
+            env.pop("BOOTROM", None)    # run.sh uses the copy in the device folder
+            self.log("  bootrom: {}".format(bundled[0].name))
+        elif dev_meta.get("needs_bootrom"):
             bootrom = env.get("BOOTROM", "")
             if not bootrom or not Path(bootrom).exists():
                 bootrom = filedialog.askopenfilename(
@@ -1124,7 +1264,10 @@ class App(tk.Tk):
                 "QEMU -M      {}".format(dev.get("qemu_machine", "?")),
                 "Needs root   {}".format("Yes" if dev.get("needs_sudo") else "No"),
                 "Bootrom      {}".format(
-                    "Required" if dev.get("needs_bootrom") else "Not required"),
+                    ("Bundled (" + next(iter(sorted(d["path"].glob("bootrom_*")))).name + ")")
+                    if dev.get("needs_bootrom") and any(d["path"].glob("bootrom_*"))
+                    else "Required (not bundled; set BOOTROM)" if dev.get("needs_bootrom")
+                    else "Not required"),
                 "Status       {}".format(pid_str),
                 "Path         {}".format(d["path"]),
             ]
@@ -1177,7 +1320,7 @@ def main() -> None:
         epilog="""
 Environment
   QEMU     qemu-system-arm binary  (auto-detected from build/ or PATH if unset)
-  BOOTROM  bootrom dump path       (m68ap / n45ap only; prompted on first start)
+  BOOTROM  bootrom dump path       (only for devices without a bundled bootrom)
 
 Examples
   python3 tools/manageFirm.py

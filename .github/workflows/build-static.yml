@@ -1,0 +1,165 @@
+# Place this file at .github/workflows/build-static.yml
+name: Build QEMU (static + SDL)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Fully static binary: no SDL window (SDL cannot be linked statically) ────
+  build-static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # libssl-dev, libpixman-1-dev and libglib2.0-dev ship the static .a files
+        # (libcrypto.a, libpixman-1.a, libglib-2.0.a) that --static links against.
+        # libpcre2-dev, libffi-dev and zlib1g-dev are glib's static dependencies.
+        # libgio is disabled below: statically it needs libmount.a, which the
+        # Ubuntu packages do not ship.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential make ninja-build pkg-config \
+            python3 python3-venv python3-pip git ccache \
+            libssl-dev libpixman-1-dev libglib2.0-dev libslirp-dev libfdt-dev \
+            libpcre2-dev libffi-dev zlib1g-dev
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: static-${{ runner.os }}
+
+      - name: Configure
+        # --static and --enable-pie are mutually exclusive, so PIE is off.
+        run: |
+          mkdir build && cd build
+          ../configure \
+            --static --disable-pie \
+            --disable-sdl --disable-gtk --disable-gio \
+            --enable-slirp --disable-cocoa \
+            --target-list=arm-softmmu \
+            --disable-capstone --disable-guest-agent \
+            --extra-cflags=-I/usr/include/openssl \
+            --extra-ldflags='-lcrypto' \
+            --disable-werror
+
+      - name: Build
+        run: make -C build -j"$(nproc)"
+
+      - name: Verify the binary is static and starts
+        run: |
+          file build/qemu-system-arm
+          if ldd build/qemu-system-arm 2>&1 | grep -q 'not a dynamic executable'; then
+            echo "OK: statically linked"
+          else
+            ldd build/qemu-system-arm
+            echo "::error::qemu-system-arm is dynamically linked"
+            exit 1
+          fi
+          build/qemu-system-arm --version
+          build/qemu-system-arm -M help
+
+      - name: Install into a staging directory
+        run: make -C build install DESTDIR="$PWD/stage"
+
+      - name: Package
+        run: |
+          root=pkg/qemu-ios-static
+          mkdir -p "$root"
+          cp -a stage/usr/local/bin stage/usr/local/share "$root/"
+          find "$root/bin" -type f -exec strip {} +
+          ln -s ../share/qemu "$root/bin/pc-bios"
+          find "$root" -maxdepth 3 | sort
+          tar -C pkg -czf qemu-ios-linux-x86_64-static.tar.gz qemu-ios-static
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-ios-linux-x86_64-static
+          path: qemu-ios-linux-x86_64-static.tar.gz
+
+  # ── Dynamic binary with the SDL display (your README build) ────────────────
+  build-sdl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # libavcodec-dev + libavutil-dev enable IT_HAVE_AVCODEC so the full AMC
+        # audio-decode path (including amc_local / amc_engine0) is compiled and
+        # linked; without them only the non-avcodec code paths are tested.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential make ninja-build pkg-config \
+            python3 python3-venv python3-pip git ccache \
+            libssl-dev libsdl2-dev libpixman-1-dev libglib2.0-dev \
+            libslirp-dev libfdt-dev zlib1g-dev \
+            libavcodec-dev libavutil-dev
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: sdl-${{ runner.os }}
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          ../configure \
+            --enable-sdl --enable-slirp --disable-cocoa \
+            --target-list=arm-softmmu \
+            --disable-capstone --disable-guest-agent \
+            --extra-cflags=-I/usr/include/openssl \
+            --extra-ldflags='-lcrypto' \
+            --disable-werror --enable-pie
+
+      - name: Build
+        run: make -C build -j"$(nproc)"
+
+      - name: Verify SDL is built in
+        run: |
+          build/qemu-system-arm --version
+          ldd build/qemu-system-arm | grep -i sdl2
+          build/qemu-system-arm -display help | grep -w sdl
+
+      - name: Install into a staging directory
+        run: make -C build install DESTDIR="$PWD/stage"
+
+      - name: Package
+        run: |
+          root=pkg/qemu-ios-sdl
+          mkdir -p "$root"
+          cp -a stage/usr/local/bin stage/usr/local/share "$root/"
+          find "$root/bin" -type f -exec strip {} +
+          ln -s ../share/qemu "$root/bin/pc-bios"
+          find "$root" -maxdepth 3 | sort
+          tar -C pkg -czf qemu-ios-linux-x86_64-sdl.tar.gz qemu-ios-sdl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-ios-linux-x86_64-sdl
+          path: qemu-ios-linux-x86_64-sdl.tar.gz
+
+  # ── Attach both tarballs to the release on v* tags ─────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-static, build-sdl]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
