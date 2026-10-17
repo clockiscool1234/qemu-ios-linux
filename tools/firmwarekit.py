@@ -1909,10 +1909,10 @@ def activate_volume(m, log=print, image=None):
 # boots with amfi_get_out_of_my_way=1: with AMFI asking amfid about every ad hoc signed library, Substrate's launcher
 # makes amfid wait on itself and the boot stops before SpringBoard.
 #
-# Scope: iPhone OS 2.0 and later, on the boards whose rootfs create mounts (m68ap, n45ap, n18ap, n88ap, k48ap, n81ap,
-# n90ap).  Substrate comes for 3.x to 6.x, Cydia HTTPatch for 3.x (as in Swift).  Not ported: the iPod touch 2G's
-# it_typein-by-Substrate move (n72ap's create is a stub here, with no rootfs), and `firmwarekit edit --action
-# jailbreak` on an existing device.
+# Scope: iPhone OS 2.0 and later, on the boards whose rootfs create mounts (m68ap, n45ap, n72ap, n18ap, n88ap, k48ap,
+# n81ap, n90ap; n72ap through n72_nand.build, so not with --skip-nand).  Substrate comes for 3.x to 6.x, Cydia
+# HTTPatch for 3.x (as in Swift).  Not ported: the iPod touch 2G's it_typein-by-Substrate move, and
+# `firmwarekit edit --action jailbreak` on an existing device.
 
 JB_SOURCE = ("https://raw.githubusercontent.com/LukeZGD/Legacy-iOS-Kit/"
              "4b0a582f4d53e105be373b495734c8ed639fd634/resources/jailbreak/")
@@ -2557,7 +2557,9 @@ def create_img3(args, entry, ipsw, ri, out, work):
         print("note: no --bootrom given; run.sh will need $BOOTROM (or %s in this folder)" % BOOTROMS[board][1])
     if not getattr(args, "skip_nand", False):
         import n72_nand
-        n72_nand.build(args.ipsw, entry, ri, out, work)
+        n72_nand.build(args.ipsw, entry, ri, out, work,
+                       jailbreak_dir=getattr(args, "jb_dir", None) if getattr(args, "jailbreak", False) else None,
+                       activate=not getattr(args, "skip_activation", False))
     run_body = SH_DIR_LINE
     run_body += _cleanup_trap(tmp_prefix)
     run_body += bootrom_guard(board)
@@ -3113,13 +3115,13 @@ def create(args):
         if not os.path.isfile(args.guest_package):
             raise FirmwareError("--guest-package: %s not found" % args.guest_package)
         if BOARD_META[board][4] == "img3":
-            raise FirmwareError("--guest-package: %s's create here builds no rootfs yet (n72ap NOR only); nothing "
-                                "to seed" % board)
+            raise FirmwareError("--guest-package: %s's create does not seed a guest package yet (the jailbreak "
+                                "and activation edits are supported, this one is not)" % board)
         if getattr(args, "no_volume_edit", False):
             raise FirmwareError("--guest-package edits the volume; it can't be combined with --no-volume-edit")
     if getattr(args, "jailbreak", False):
-        if BOARD_META[board][4] == "img3":
-            raise FirmwareError("--jailbreak: %s's create here builds no rootfs (IMG3 stub); nothing to edit" % board)
+        if BOARD_META[board][4] == "img3" and getattr(args, "skip_nand", False):
+            raise FirmwareError("--jailbreak edits the system volume, which --skip-nand does not build for %s" % board)
         if getattr(args, "no_volume_edit", False):
             raise FirmwareError("--jailbreak edits the volume; it can't be combined with --no-volume-edit")
         if int(ri["version"].split(".")[0] or 0) < 2:

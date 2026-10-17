@@ -929,6 +929,48 @@ def ipsw_filename(product: str, version: str, build: str) -> str:
     return "{}_{}_{}_Restore.ipsw".format(product, version, build)
 
 
+_IPSW_PRODUCT_RE = re.compile(r"(?<![A-Za-z])(iPhone|iPod|iPad)(\d+),(\d+)")
+_IPSW_BUILD_RE   = re.compile(r"(?<![A-Za-z0-9])(\d{1,2}[A-Z]\d{1,4}[a-z]?)(?![A-Za-z0-9])")
+_IPSW_VERSION_RE = re.compile(r"(?<![\d.])(\d{1,2}\.\d+(?:\.\d+)?)(?![\d.])")
+
+
+def parse_ipsw_filename(path: str) -> dict:
+    """What an IPSW's file name says about it: Apple's 'iPod2,1_3.1.3_7E18_Restore.ipsw'.
+
+    Returns {"board", "build", "version"} for what could be recognised (keys are missing otherwise):
+    the board from the product ID (falling back to the build ID when only one device has that build),
+    the build from the build ID (falling back to the version when only one build of the board has it).
+    The result only names boards and builds this tool knows (DEVICES, with the catalog merged in)."""
+    name = Path(path).name
+    if name.lower().endswith(".ipsw"):
+        name = name[:-5]
+    out: dict = {}
+    m = _IPSW_PRODUCT_RE.search(name)
+    bm = _IPSW_BUILD_RE.search(name)
+    vm = _IPSW_VERSION_RE.search(name)
+    build = bm.group(1) if bm else ""
+    version = vm.group(1) if vm else ""
+    board = ""
+    if m:
+        product = "{}{},{}".format(m.group(1), m.group(2), m.group(3))
+        board = next((k for k, d in DEVICES.items() if d["product"] == product), "")
+    elif build:
+        owners = [k for k, d in DEVICES.items() if build in d["builds"]]
+        board = owners[0] if len(owners) == 1 else ""
+    if not board:
+        return out
+    out["board"] = board
+    builds = DEVICES[board]["builds"]
+    if build in builds:
+        out["build"] = build
+        out["version"] = builds[build]
+    elif version:
+        same = [b for b, v in builds.items() if v == version]
+        if len(same) == 1:
+            out["build"], out["version"] = same[0], version
+    return out
+
+
 def fetch_ipsw_download_url(product: str, build: str) -> Optional[str]:
     """Query ipsw.me for the Apple CDN URL of a specific IPSW."""
     url = IPSW_ME_API.format(product=product, build=build)
@@ -1576,6 +1618,11 @@ class CreateDeviceDialog(tk.Toplevel):
         ttk.Button(bf, text="Cancel", command=self._close).pack(
             side="left", padx=6)
 
+        # Picking (or pasting) an IPSW selects its device and iOS build from the file name.
+        # Registered last so the first refresh above never triggers it.
+        self._ipsw_detected = None
+        self._ipsw_var.trace_add("write", self._ipsw_path_changed)
+
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _cur_board(self) -> str:
@@ -1668,6 +1715,37 @@ class CreateDeviceDialog(tk.Toplevel):
         is_browse = self._ipsw_mode.get() == "browse"
         self._ipsw_entry.configure(state="normal" if is_browse else "disabled")
         self._ipsw_brow.configure(state="normal" if is_browse else "disabled")
+
+    def _ipsw_path_changed(self, *_args) -> None:
+        """Select the Device and iOS Build the IPSW's file name names (iPod2,1_3.1.3_7E18_Restore.ipsw).
+        Acts once per distinct result, so the person can still change the choice afterwards."""
+        p = self._ipsw_var.get().strip()
+        det = parse_ipsw_filename(p) if p.lower().endswith(".ipsw") else {}
+        if not det or det == self._ipsw_detected:
+            return
+        self._ipsw_detected = det
+        board, build = det["board"], det.get("build", "")
+        if board not in self._board_keys:
+            return
+        if board != self._cur_board():
+            self._board_cb.current(self._board_keys.index(board))
+            self._refresh_board()
+        if build and build not in self._build_keys:      # hidden by the beta / coming-soon filters
+            info = build_info(board, build)
+            if info.get("prerelease"):
+                self._show_beta.set(True)
+            if info.get("status") == "coming_soon":
+                self._show_unsup.set(True)
+            self._refresh_builds()
+        if build and build in self._build_keys:
+            self._build_cb.current(self._build_keys.index(build))
+            self._refresh_out()
+            self._refresh_hint()
+        name = DEVICES[board]["name"]
+        if build:
+            self._log("IPSW file name: {} / iOS {} ({}).".format(name, det["version"], build))
+        else:
+            self._log("IPSW file name: {}; its iOS build is not in the list, pick it above.".format(name))
 
     def _browse_gp(self) -> None:
         p = filedialog.askopenfilename(parent=self, title="Select a guest package",
