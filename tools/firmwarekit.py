@@ -25,9 +25,11 @@ Outputs in --out:  iBoot.bin  nor.bin  nand/  identity.json  run.sh
 Boards that boot through a bootrom (m68ap, n45ap, n72ap) take `--bootrom PATH`: the file is copied into
 --out (as bootrom_<soc>) and run.sh uses that copy, so no $BOOTROM is needed to run the device.
 
-NOT ported from Swift: guest package / GL hook, SystemConfiguration (Wi-Fi/proxy) seeding,
-HFS+ journaling, catalog date normalisation, IMG3 decryption
-(n72/n88/k48/n81/n90 need decryption keys from the catalog; those boards produce a stub run.sh).
+Ported from Swift: IMG3 decryption with the catalog keys (every board; ipad1_fw.decrypt_catalog), the n72ap NOR
+(all_flash img3s packed with SHSH wrapped under the emulated UID, N72NOR) and the guest package seed
+(`--guest-package ARMV6/ARMV7.itpack`: loader, seed package, OpenGLES front end / AppSync hooks; guest_package.py).
+NOT ported from Swift: the n72ap system volume and NAND page store (N72NAND), SystemConfiguration (Wi-Fi/proxy)
+seeding, HFS+ journaling, catalog date normalisation, the guest package's FitCheck load proof.
 Activation patch and rootfs decrypt/grow are fully ported for m68ap/n45ap; the lockdownd activation patch
 (with ad-hoc re-signing of the signed-era binary) also runs on k48ap/n81ap/n90ap, needs root to mount the
 rootfs, and is skipped by --skip-activation.
@@ -2413,6 +2415,8 @@ def create_img2(args, entry, ipsw, ri, out, work):
         print("mounting and editing (needs root + hfsplus) ...")
         def edits(m):
             r = edit_volume(m, iboot, ipsw, ri["kernelcache"], activate=not args.skip_activation)
+            if getattr(args, "guest_package", None):   # after edit_volume: the seed removes the baked jobs it replaces
+                r["guest_package"] = seed_guest_package(m, args, board)
             if getattr(args, "jailbreak", False):      # after edit_volume: it removes launch daemons
                 r["jailbreak"] = jailbreak_volume(m, args.jb_dir, vol)
             return r
@@ -2452,7 +2456,7 @@ def create_img2(args, entry, ipsw, ri, out, work):
 cp -n "$D/nor.bin" /tmp/%s-nor.bin
 chmod u+w /tmp/%s-nor.bin
 exec ${QEMU:-qemu-system-arm} \\
-  -M %s,bootrom=$BOOTROM,iboot="$D/iBoot.bin",nand="$D/nand",nand-overlay=/tmp/%s-ovl,imei=%s,wifi-mac=%s \\
+  -M %s,bootrom=$BOOTROM,direct-iboot="$D/iBoot.bin",nand="$D/nand",nand-overlay=/tmp/%s-ovl,imei=%s,wifi-mac=%s \\
   -drive if=pflash,format=raw,file=/tmp/%s-nor.bin \\
   -serial mon:stdio -display sdl,show-cursor=on -audio driver=none \\
   -qmp unix:/tmp/%s-qmp.sock,server,nowait
@@ -2463,8 +2467,8 @@ exec ${QEMU:-qemu-system-arm} \\
 
     print("""
 done: %s
-Not done (the Swift firmwarekit handles these): guest package / OpenGLES hook, Wi-Fi + proxy
-SystemConfiguration seeding, HFS+ journaling, catalog date normalisation."""
+Not done (the Swift firmwarekit handles these): Wi-Fi + proxy SystemConfiguration seeding, HFS+ journaling,
+catalog date normalisation.  The guest package / OpenGLES hook is baked with --guest-package ITPACK."""
           % out)
 
 
@@ -2472,40 +2476,43 @@ SystemConfiguration seeding, HFS+ journaling, catalog date normalisation."""
 # IMG3 boards: n72ap (iPod Touch 2G/3G) -- NOR packed with img3s
 # ---------------------------------------------------------------------------------------------
 
+def _build_nor_module():
+    # appended, never first: imgtools/imgtools has older copies of ipad1_fw/ipad1_kboot/macho/... that must not
+    # shadow this directory's
+    d = os.path.join(ROOT, "imgtools", "imgtools")
+    if d not in sys.path:
+        sys.path.append(d)
+    import build_nor
+    return build_nor
+
+
 def create_img3(args, entry, ipsw, ri, out, work):
-    """Build NOR+NAND for n72ap (IMG3, NOR packed at 0x8000, NAND 4-chip).
-    IMG3 decryption requires catalog keys; this stub extracts available files."""
+    """n72ap (iPod Touch 2G): decrypt the boot chain with the catalog's IMG3 keys, pack the all_flash img3s
+    into a 1 MiB NOR (IMG2 superblock, SysCfg, images at 0x8000 with SHSH wrapped under the emulated UID,
+    nvram at 0xfc000: imgtools/build_nor.py, FirmwareKit's N72NOR) and write the iBoot the machine enters.
+
+    Not done: the system volume and the NAND page store (FirmwareKit's N72NAND: imgtools/build_nand.py), so
+    run.sh still needs a nand/ directory made by it."""
     board = ri["board"]
     qemu_machine, tmp_prefix, nand_banks, bbt_map, _ = BOARD_META[board]
-    recipe = entry["recipe"]
-    system_bytes = int(recipe.get("system_mib", 7168)) << 20
+    major = int((ri["version"].split(".")[0] or "0"))
+    bn = _build_nor_module()
 
-    # Extract all_flash img3s (encrypted; decryption keys needed from catalog)
+    # all_flash img3s: LLB, iBoot, DeviceTree, logos ... (the NOR's contents); kept as shipped in img3/
     prefix = "Firmware/all_flash/all_flash.%s.production/" % board
-    img3_files = {}
-    iboot_member = None
-    for n in ipsw.names():
-        if n.startswith(prefix) and (n.endswith(".img3") or n.endswith(".img2")):
-            img3_files[os.path.basename(n)] = n
-            if "iBoot" in n:
-                iboot_member = n
-
-    print("all_flash members: %s" % ", ".join(sorted(img3_files)))
-
-    # Write raw (encrypted) img3s for reference / manual decryption
+    members = {os.path.basename(n): n for n in ipsw.names() if n.startswith(prefix) and not n.endswith("/")}
+    flash_dir = os.path.join(work, "all_flash")
     img3_dir = os.path.join(out, "img3")
+    os.makedirs(flash_dir, exist_ok=True)
     os.makedirs(img3_dir, exist_ok=True)
-    for fname, member in sorted(img3_files.items()):
-        with open(os.path.join(img3_dir, fname), "wb") as f:
-            f.write(ipsw.read(member))
-    print("wrote %d img3 files to img3/ (encrypted; need catalog keys to build NOR)" % len(img3_files))
-
-    # Extract kernelcache and device tree for reference
-    kc = ri.get("kernelcache")
-    if kc and kc in ipsw.names():
-        with open(os.path.join(out, "kernelcache.img3"), "wb") as f:
-            f.write(ipsw.read(kc))
-        print("kernelcache -> kernelcache.img3 (encrypted)")
+    for fname, member in sorted(members.items()):
+        data = ipsw.read(member)
+        with open(os.path.join(flash_dir, fname), "wb") as f:
+            f.write(data)
+        if fname.endswith((".img3", ".img2")):
+            with open(os.path.join(img3_dir, fname), "wb") as f:
+                f.write(data)
+    print("all_flash members: %s" % ", ".join(sorted(members)))
 
     ident = synthesize_iphone(args.seed or args.id + "-default", model="MB528")
     if args.wifi_mac:
@@ -2513,7 +2520,31 @@ def create_img3(args, entry, ipsw, ri, out, work):
     with open(os.path.join(out, "identity.json"), "w") as f:
         json.dump(ident, f, indent=1)
 
-    # run.sh: n72 uses a pre-built nor.bin and nand/ from the release
+    # the NOR: 2.x iBoot unwraps only iBoot's own SHSH, 3.x+ every image's (build_nor.py's docstring)
+    nor_path = os.path.join(out, "nor.bin")
+    print("building nor.bin (%s)..." % ("wrapping iBoot's SHSH only" if major < 3 else "wrapping every SHSH"))
+    try:
+        bn.build(None, flash_dir, nor_path, bn.DEFAULT_ORDER, base=bn.synth_base(ident),
+                 wrap_types=["ibot"] if major < 3 else None, hardware_uid=True)
+    except SystemExit as e:           # build_nor reports a missing image / no SHSH as SystemExit
+        raise FirmwareError("nor.bin: %s" % e)
+
+    # decrypt the boot chain with the catalog keys (iBoot.bin is the image the machine enters on 3.x+)
+    dec_dir = os.path.join(work, "decrypted")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ipad1_fw
+    print("decrypting firmware components using catalog keys...")
+    ipad1_fw.decrypt_catalog(args.ipsw, entry, dec_dir, rootfs=False)
+    iboot_out = None
+    if major >= 3 and os.path.exists(os.path.join(dec_dir, "iBoot.bin")):
+        iboot_out = os.path.join(out, "iBoot.bin")
+        shutil.copyfile(os.path.join(dec_dir, "iBoot.bin"), iboot_out)
+    for name in ("kernelcache.mach", "DeviceTree.bin"):
+        if os.path.exists(os.path.join(dec_dir, name)):
+            shutil.copyfile(os.path.join(dec_dir, name), os.path.join(out, name))
+
+    # run.sh: the machine option the NOR is wrapped for (aes-uid=hardware: the AES engine honors iBoot's UID
+    # derivation, as N72NOR wraps for), the NOR, the NAND store and iBoot when 3.x+
     if args.bootrom_path:
         install_bootrom(args.bootrom_path, board, out)
     else:
@@ -2522,14 +2553,14 @@ def create_img3(args, entry, ipsw, ri, out, work):
     run_body += _cleanup_trap(tmp_prefix)
     run_body += bootrom_guard(board)
     run_body += """exec ${QEMU:-qemu-system-arm} \\
-  -M %s,bootrom=$BOOTROM,nand="$D/nand",nor="$D/nor.bin" \\
+  -M %s,bootrom=$BOOTROM,aes-uid=hardware,nand="$D/nand",nor="$D/nor.bin"%s \\
   -serial mon:stdio -display sdl,show-cursor=on -audio driver=none
-""" % qemu_machine
+""" % (qemu_machine, ',direct-iboot="$D/iBoot.bin"' if iboot_out else "")
     _write_run_sh(os.path.join(out, "run.sh"), run_body)
     print("""
 done: %s
-n72ap requires IMG3 decryption keys (from the catalog's 'keys' section) to build a working NOR.
-The raw encrypted img3s are in img3/. See the Swift FirmwareKit (N72NOR.swift) for the NOR layout.""" % out)
+nor.bin%s written.  The system volume and the NAND page store are not built here yet (N72NAND; see
+imgtools/build_nand.py): run.sh expects a nand/ directory next to it.""" % (out, " and iBoot.bin" if iboot_out else ""))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2573,6 +2604,36 @@ def activate_kboot_rootfs(system_img, work, log=print):
         print("warning: lockdownd was NOT activated (%s)" % e)
         print("         the volume inside the image has no room for the patched file; the bundle is built unactivated")
         return None
+    finally:
+        try:
+            os.rmdir(mnt)
+        except OSError:
+            pass
+
+
+def seed_guest_package(m, args, board, log=print):
+    """Guest package seed (the loader, the seed package, the GL/AppSync hooks) over the mounted writable system
+    volume `m`: guest_package.seed.  -> the lock's guest_package record."""
+    sys.path.insert(0, HERE)
+    import guest_package
+    try:
+        written, rec = guest_package.seed(m, args.guest_package, gles=not getattr(args, "no_gles", False),
+                                          board=board, log=log)
+    except guest_package.GuestPackageError as e:
+        raise FirmwareError("guest package: %s" % e)
+    log("guest package %s (seed %d): %d paths written, hooks: %s"
+        % (rec["family"], rec["seed"], len(written), ", ".join(os.path.basename(h) for h in rec["hooks"]) or "none"))
+    return rec
+
+
+def guest_package_kboot_rootfs(system_img, work, args, board, log=print):
+    """The guest-package seed inside the extracted rootfs image of a kboot board.  Needs root + hfsplus."""
+    mnt = os.path.join(work, "mnt_gp")
+    print("seeding the guest package (loader, agent, GL hook) in the rootfs...")
+    try:
+        return with_mounted(system_img, mnt, lambda m: seed_guest_package(m, args, board, log))
+    except OSError as e:
+        raise FirmwareError("the guest package seed failed (%s); the volume inside the image may be full" % e)
     finally:
         try:
             os.rmdir(mnt)
@@ -2633,6 +2694,12 @@ def create_kboot(args, entry, ipsw, ri, out, work):
               "data_ark.plist)" % entry.get("version"))
     elif board in _ACTIVATED_KBOOT and not getattr(args, "skip_activation", False):
         activate_kboot_rootfs(system_img, work)
+
+    # 4b2. the guest package seed (loader, seed package, OpenGLES front end / AppSync hooks).  Needs root + hfsplus.
+    if getattr(args, "guest_package", None):
+        gp_rec = guest_package_kboot_rootfs(system_img, work, args, board)
+        with open(os.path.join(out, "guest_package.json"), "w") as f:
+            json.dump(gp_rec, f, indent=1)
 
     # 4c. the jailbreak option (afc2, Cydia, Substrate), after the activation edit.  Needs root + hfsplus.
     if getattr(args, "jailbreak", False):
@@ -3030,6 +3097,15 @@ def create(args):
     out = os.path.abspath(args.out)
     if os.path.exists(out) and os.listdir(out):
         raise FirmwareError("%s exists and is not empty; refusing to overwrite" % out)
+    if getattr(args, "guest_package", None):
+        args.guest_package = os.path.abspath(os.path.expanduser(args.guest_package))
+        if not os.path.isfile(args.guest_package):
+            raise FirmwareError("--guest-package: %s not found" % args.guest_package)
+        if BOARD_META[board][4] == "img3":
+            raise FirmwareError("--guest-package: %s's create here builds no rootfs yet (n72ap NOR only); nothing "
+                                "to seed" % board)
+        if getattr(args, "no_volume_edit", False):
+            raise FirmwareError("--guest-package edits the volume; it can't be combined with --no-volume-edit")
     if getattr(args, "jailbreak", False):
         if BOARD_META[board][4] == "img3":
             raise FirmwareError("--jailbreak: %s's create here builds no rootfs (IMG3 stub); nothing to edit" % board)
@@ -3705,24 +3781,115 @@ def selftest(_args):
         r = subprocess.run(["sh", sh], cwd="/", capture_output=True, text=True, env=env)
         check("run.sh: no bootrom anywhere -> clear error", r.returncode == 1 and "--bootrom" in r.stdout, r.stdout)
 
-        # create_img3 end to end on a fake IPSW (writes run.sh, copies the bootrom)
+        # create_img3 end to end on a fake IPSW: the NOR with every all_flash image's SHSH wrapped under the
+        # emulated UID, iBoot.bin from the (stubbed) decrypt, run.sh with the bootrom guard
+        bn = _build_nor_module()
+        shsh_plain = bytes(range(128))
+
+        def fake_img3(typ):
+            body = b"DATA-" + typ.encode() + bytes(11 - len(typ) + 3)
+            data_tag = b"ATAD" + struct.pack("<II", 12 + len(body), len(body)) + body
+            shsh_tag = b"HSHS" + struct.pack("<II", 12 + 128, 128) + shsh_plain
+            tags = data_tag + shsh_tag
+            hdr = b"3gmI" + struct.pack("<III", 0x14 + len(tags), len(tags), 0) + typ.encode()[::-1]
+            return hdr + tags
+
+        flash = "Firmware/all_flash/all_flash.n72ap.production/"
+        fakes = {flash + "%s.n72ap.img3" % t: fake_img3(t) for t in bn.DEFAULT_ORDER}
+
         class FakeIPSW:
             def names(self):
-                return ["Firmware/all_flash/all_flash.n72ap.production/iBoot.n72ap.RELEASE.img3"]
+                return list(fakes)
             def read(self, n):
-                return b"x"
+                return fakes[n]
         class A: pass
         a = A()
-        a.seed, a.id, a.wifi_mac, a.bootrom_path = None, "n72ap-test", None, src
+        a.seed, a.id, a.wifi_mac, a.bootrom_path, a.ipsw = None, "n72ap-test", None, src, "unused.ipsw"
         out = os.path.join(d, "n72")
         os.makedirs(out)
         import contextlib, io
-        with contextlib.redirect_stdout(io.StringIO()):
-            create_img3(a, {"recipe": {}}, FakeIPSW(), {"board": "n72ap", "kernelcache": None}, out, d)
+        import ipad1_fw
+        real_decrypt = ipad1_fw.decrypt_catalog
+
+        def fake_decrypt(ipsw_path, entry, dec, rootfs=True):
+            os.makedirs(dec, exist_ok=True)
+            for n in ("iBoot.bin", "kernelcache.mach", "DeviceTree.bin"):
+                with open(os.path.join(dec, n), "wb") as f:
+                    f.write(n.encode())
+        ipad1_fw.decrypt_catalog = fake_decrypt
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                create_img3(a, {"recipe": {}}, FakeIPSW(),
+                            {"board": "n72ap", "kernelcache": None, "version": "3.1.3"}, out, d)
+        finally:
+            ipad1_fw.decrypt_catalog = real_decrypt
         runsh = open(os.path.join(out, "run.sh")).read()
         check("n72ap bundle: bootrom_s5l8720 copied, run.sh guards on it",
               open(os.path.join(out, "bootrom_s5l8720"), "rb").read() == b"ROM" * 100
               and "bootrom_s5l8720" in runsh and "-M iPod-Touch,bootrom=$BOOTROM" in runsh and SH_DIR_LINE in runsh)
+        check("n72ap bundle: run.sh selects the wrapped UID and iBoot.bin",
+              "aes-uid=hardware" in runsh and 'direct-iboot="$D/iBoot.bin"' in runsh
+              and open(os.path.join(out, "iBoot.bin"), "rb").read() == b"iBoot.bin")
+        nor = open(os.path.join(out, "nor.bin"), "rb").read()
+        check("n72ap NOR: 1 MiB, IMG2 superblock, LLB img3 at 0x8000",
+              len(nor) == 0x100000 and nor[:4] == b"2GMI" and nor[0x8000:0x8004] == b"3gmI"
+              and nor[0x8010:0x8014][::-1] == b"illb")
+        o, wrapped_ok = 0x8000, True
+        while nor[o:o + 4] == b"3gmI":
+            full = struct.unpack_from("<I", nor, o + 4)[0]
+            t = o + 0x14
+            while nor[t:t + 4] != b"HSHS":
+                t += struct.unpack_from("<I", nor, t + 4)[0]
+            key = bn.shsh_wrap_key(bn.DEFAULT_UID_KEY, hardware=True)
+            wrapped_ok &= nor[t + 12:t + 140] != shsh_plain and bn._aes_cbc(key, nor[t + 12:t + 140], False) == shsh_plain
+            o += full
+        check("n72ap NOR: every image's SHSH is wrapped under the UID-derived key", wrapped_ok and o > 0x8000)
+        check("n72ap NOR: nvram carries the identity's Wi-Fi address",
+              json.load(open(os.path.join(out, "identity.json")))["wifi-mac"].upper().encode() in nor[0xFC000:])
+
+        # guest package seed: a synthetic itpack over a fake volume (loader, hook swap, baked copy, state, offer)
+        import guest_package as gp
+        gdir = os.path.join(d, "gp")
+        man = {"format": 1, "serial": 14, "version": "1.1.14", "family": "n72-ios3", "arch": "armv6",
+               "stub": False, "requires": {"boards": ["n72ap"], "builds": ["7E18", "5*"], "link": "modern"},
+               "provides": [], "jobs": ["jobs/com.qemu.it-agent.plist"],
+               "hooks": [{"file": "hooks/OpenGLES", "target": gp.OPENGLES, "respring": True}],
+               "files": []}
+        payloads = [("bin/it_agent", "755", b"AGENT"), ("jobs/com.qemu.it-agent.plist", "644", b"<plist/>"),
+                    ("hooks/OpenGLES", "755", b"GLFRONT")]
+        for n, m_, b_ in payloads:
+            man["files"].append({"name": n, "mode": m_, "size": len(b_), "sha256": hashlib.sha256(b_).hexdigest()})
+        ents = [("n72-ios3/manifest.json", json.dumps(man).encode())] \
+            + [("n72-ios3/" + n, b_) for n, _, b_ in payloads] \
+            + [("loader/it_boot", b"LOADER"), ("loader/com.qemu.it-boot.plist", b"<boot/>")]
+        pk = os.path.join(d, "armv6.itpack")
+        gp.write_itpack(pk, ents)
+        check("itpack round trip", gp.read_itpack(pk) == ents)
+        vol = os.path.join(gdir, "vol")
+        for rel, data in ((gp.OPENGLES[1:], b"STOCKGL"), ("System/Library/LaunchDaemons/com.qemu.it-agent.plist", b"old")):
+            os.makedirs(os.path.dirname(os.path.join(vol, rel)), exist_ok=True)
+            open(os.path.join(vol, rel), "wb").write(data)
+        os.makedirs(os.path.join(vol, "System/Library/CoreServices"))
+        with open(os.path.join(vol, gp.SYSTEM_VERSION), "wb") as f:
+            plistlib.dump({"ProductBuildVersion": "7E18"}, f)
+        written, rec = gp.seed(vol, pk, gles=True, log=lambda *_: None)
+        gl = os.path.join(vol, gp.OPENGLES[1:])
+        check("guest seed: the GL front end replaces the stock engine, <target>.baked keeps it",
+              open(gl, "rb").read() == b"GLFRONT" and open(gl + ".baked", "rb").read() == b"STOCKGL")
+        check("guest seed: loader, package, current link and state",
+              open(os.path.join(vol, gp.LOADER[0]), "rb").read() == b"LOADER"
+              and os.readlink(os.path.join(vol, gp.ROOT, "current")) == "pkgs/14"
+              and open(os.path.join(vol, gp.ROOT, "state")).read() == "seed 14\nhook 1 " + gp.OPENGLES + "\n"
+              and not os.path.exists(os.path.join(vol, "System/Library/LaunchDaemons/com.qemu.it-agent.plist")))
+        offer = open(os.path.join(vol, gp.ROOT, "pkgs/14/offer")).read().split("\n")
+        check("guest seed: offer lines (ltpkg header, build, serial, file/job/hook)",
+              offer[:3] == ["ltpkg 1", "build 7E18", "serial 14 1.1.14"] and offer[3].startswith("file 0 bin/it_agent 755 5 ")
+              and offer[4].startswith("job 1 jobs/") and offer[5].endswith(gp.OPENGLES + " respring"))
+        shutil.rmtree(os.path.join(vol, "usr"))
+        os.remove(gl + ".baked")
+        open(gl, "wb").write(b"STOCKGL")
+        _, rec2 = gp.seed(vol, pk, gles=False, log=lambda *_: None)
+        check("guest seed: --no-gles keeps the GL hook out", rec2["hooks"] == [] and open(gl, "rb").read() == b"STOCKGL")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3838,6 +4005,12 @@ def main():
                         "amfi_get_out_of_my_way=1); the bootstrap is downloaded once (SHA-1 pinned)")
     c.add_argument("--jailbreak-cache", metavar="DIR",
                    help="where the Cydia bootstrap is kept (default: ~/.cache/firmwarekit/Jailbreak)")
+    c.add_argument("--guest-package", metavar="ITPACK",
+                   help="bake the guest-package loader and seed package from an .itpack (contrib/guest-package/"
+                        "build.sh makes armv6.itpack / armv7.itpack; kboot boards and m68ap/n45ap; needs root "
+                        "and the hfsplus module)")
+    c.add_argument("--no-gles", action="store_true",
+                   help="with --guest-package: leave the GL hooks (the OpenGLES front end, the MBX shim) out")
     c.add_argument("--skip-sha1", "--skip-sha1sum", dest="skip_sha1", action="store_true",
                    help="skip checking the IPSW SHA-1 hash against the catalog")
     c.add_argument("--bootrom", metavar="PATH",

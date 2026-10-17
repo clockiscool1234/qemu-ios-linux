@@ -111,26 +111,30 @@ K48_ORDER = ["illb", "ibot", "dtre", "logo", "recm", "nsrv", "bat0", "bat1",
              "glyC", "glyP", "chg0", "chg1", "batF"]
 
 
-def shsh_wrap_key(uid_key):
+def shsh_wrap_key(uid_key, hardware=False):
     """The key iBoot derives from the device UID to unwrap a flash SHSH.
 
     S5L8720 (7E18 @0x0ff110a6): AES-128 decrypt of SHSH_KDF_CONST with the
     UID. S5L8930 (817.29 @0x5ff0d308, AES setup 0x30100): AES encrypt with
     the 256-bit UID; the first 16 bytes are the AES-128 wrapping key.
+
+    hardware=True: the S5L8720 machine run with aes-uid=hardware (iBoot's first AES request has the
+    encrypt bit set and the engine honors it), so the key is the constant *encrypted* under the 128-bit
+    UID, as FirmwareKit's N72NOR wraps for.
     """
-    if len(uid_key) == 32:
+    if len(uid_key) == 32 or hardware:
         return _aes_cbc(uid_key, SHSH_KDF_CONST, encrypt=True)
     return _aes_cbc(uid_key, SHSH_KDF_CONST, encrypt=False)
 
 
-def wrap_shsh(data, uid_key):
+def wrap_shsh(data, uid_key, hardware=False):
     """Encrypt an img3's SHSH tag so iBoot's in-place unwrap recovers it.
 
     The SHSH tag sits past sigCheckArea, so it is not covered by the digest the
     signature is over -- rewriting it does not invalidate anything.
     """
     blob = bytearray(data)
-    key = shsh_wrap_key(uid_key)
+    key = shsh_wrap_key(uid_key, hardware)
     nopack = struct.unpack("<I", blob[8:12])[0]
     off, end = IMG3_HDR, IMG3_HDR + nopack
     while off + 12 <= end:
@@ -247,7 +251,7 @@ def all_flash_order(all_flash):
 
 
 def build(base_path, all_flash, out_path, order, verbose=True,
-          uid_key=DEFAULT_UID_KEY, base=None, wrap_types=None):
+          uid_key=DEFAULT_UID_KEY, base=None, wrap_types=None, hardware_uid=False):
     nor = bytearray(base if base is not None else open(base_path, "rb").read())
     gran, start_hi, start_lo, _ = read_img2(nor)
     image_start = gran * (start_hi + start_lo)
@@ -270,7 +274,7 @@ def build(base_path, all_flash, out_path, order, verbose=True,
         name, data = available[ident]
         wrapped = False
         if uid_key is not None and (wrap_types is None or ident in wrap_types):
-            data, wrapped = wrap_shsh(data, uid_key)
+            data, wrapped = wrap_shsh(data, uid_key, hardware_uid)
             if not wrapped:
                 # FATAL, deliberately. A NOR whose images carry plaintext SHSH
                 # fails 3.x iBoot's in-place unwrap SILENTLY -- no error, just a
@@ -358,6 +362,9 @@ def main():
                           help="leave every SHSH tag in plaintext")
     wrapping.add_argument("--wrap-shsh-types",
                           help="wrap only these comma-separated image types (2.x: ibot)")
+    ap.add_argument("--hardware-uid", action="store_true",
+                    help="wrap for a machine run with aes-uid=hardware (the KDF constant encrypted under the UID, "
+                         "as FirmwareKit's N72NOR does) instead of the legacy decrypt")
     ap.add_argument("--k48", action="store_true",
                     help="iPad 1 (S5L8930) NOR: K48AP image order and the "
                          "emulated S5L8930 UID; implies --types/--uid-key")
@@ -375,7 +382,8 @@ def main():
         uid = None if args.no_wrap_shsh else S5L8930_UID_KEY
     base = synth_base(json.load(open(args.identity))) if args.identity else None
     build(args.base, args.all_flash, args.out, types, uid_key=uid, base=base,
-          wrap_types=args.wrap_shsh_types.split(",") if args.wrap_shsh_types is not None else None)
+          wrap_types=args.wrap_shsh_types.split(",") if args.wrap_shsh_types is not None else None,
+          hardware_uid=args.hardware_uid)
 
 
 if __name__ == "__main__":
