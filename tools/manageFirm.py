@@ -720,10 +720,14 @@ class QmpAgent:
     MODEM_TIMEOUT   = 15.0      # how long to wait for the modem object to show up
     QUIT_GRACE      = 5.0       # after `quit`: wait, then SIGTERM, then SIGKILL
 
+    HOLD_MAX_AGE    = 600.0     # a hold file older than this is stale (the panel crashed mid-reboot)
+
     def __init__(self, sock: str, proc: subprocess.Popen, log: Callable,
-                 carrier: str = "", mcc_mnc: str = "", auto_quit: bool = True) -> None:
+                 carrier: str = "", mcc_mnc: str = "", auto_quit: bool = True,
+                 hold_file: str = "") -> None:
         self.sock, self.proc, self.log = sock, proc, log
         self.carrier, self.mcc_mnc, self.auto_quit = carrier, mcc_mnc, auto_quit
+        self.hold_file = hold_file
         self._sk = None
         self._rf = None
         self._wlock = threading.Lock()
@@ -863,11 +867,23 @@ class QmpAgent:
             self.log("  qmp: guest powered off (run state 'shutdown').")
             self.quit()
 
+    def _held(self) -> bool:
+        """The touch panel's "Reboot safely" is under way: it lets the guest shut down cleanly, then resets the
+        same QEMU, so the guest's SHUTDOWN must not end it.  The panel marks that with a file next to its QMP
+        socket (touchPanel.reboot_hold_path) and removes it when done; a stale one is ignored."""
+        try:
+            return bool(self.hold_file) and time.time() - os.path.getmtime(self.hold_file) < self.HOLD_MAX_AGE
+        except OSError:
+            return False
+
     def quit(self) -> None:
         """End QEMU: QMP quit, then SIGTERM, then SIGKILL if it lingers."""
         if not self.auto_quit:
             self.log("  qmp: -no-shutdown is in the extra QEMU arguments; "
                      "leaving QEMU running.")
+            return
+        if self._held():
+            self.log("  qmp: the touch panel is rebooting the device; leaving QEMU running.")
             return
         if self._quit_started:
             return
@@ -2079,7 +2095,9 @@ class CreateDeviceDialog(tk.Toplevel):
         ipsw, cat, out = (os.path.abspath(os.path.expanduser(x))
                           for x in (ipsw, cat, out))
         cmd = [
-            sys.executable, str(FIRMWAREKIT), "create",
+            # -u: unbuffered.  Piped, Python block-buffers stdout (8 KB), so the progress window would show nothing
+            # until firmwarekit exits.  As an argument (not PYTHONUNBUFFERED) it also survives pkexec's clean environment.
+            sys.executable, "-u", str(FIRMWAREKIT), "create",
             "--ipsw",    ipsw,
             "--catalog", cat,
             "--id",      "{}-{}".format(board, build),
@@ -2827,7 +2845,9 @@ class App(tk.Tk):
             QmpAgent(aw["sock"], proc, self.log,
                      carrier=prefs.get("carrier", "").strip(),
                      mcc_mnc=prefs.get("mcc_mnc", "").strip(),
-                     auto_quit="-no-shutdown" not in extra_tokens).start()
+                     auto_quit="-no-shutdown" not in extra_tokens,
+                     # same name as touchPanel.reboot_hold_path(): QMP socket + ".reboot-pending"
+                     hold_file=(panel["sock"] + ".reboot-pending") if panel else "").start()
             if panel:
                 panel["title"] = label
                 panel["scale"] = prefs["scale"]

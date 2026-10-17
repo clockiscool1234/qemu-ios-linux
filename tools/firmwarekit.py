@@ -1051,14 +1051,17 @@ def require_root(what):
                             "for it through pkexec" % what)
 
 
-def with_mounted(volume, mnt, fn):
-    require_root("mounting the volume read-write")
+def with_mounted(volume, mnt, fn, rw=True):
+    """Loop-mount `volume` (HFS+) at `mnt`, run fn(mnt), unmount.  rw=False mounts it read-only (a journaled
+    volume then mounts too, and nothing on it is touched)."""
+    require_root("mounting the volume " + ("read-write" if rw else "read-only"))
     os.makedirs(mnt, exist_ok=True)
-    r = subprocess.run(["mount", "-t", "hfsplus", "-o", "loop,rw,force", volume, mnt],
+    r = subprocess.run(["mount", "-t", "hfsplus", "-o", "loop,rw,force" if rw else "loop,ro", volume, mnt],
                        capture_output=True, text=True)
     if r.returncode:
-        raise FirmwareError("mounting the volume read-write failed (need the Linux hfsplus "
-                            "module; a journaled volume mounts read-only): " + r.stderr.strip())
+        raise FirmwareError("mounting the volume %s failed (need the Linux hfsplus "
+                            "module; a journaled volume mounts read-only): %s"
+                            % ("read-write" if rw else "read-only", r.stderr.strip()))
     try:
         return fn(mnt)
     finally:
@@ -2640,6 +2643,116 @@ def seed_guest_package(m, args, board, log=print):
     return rec
 
 
+# ---------------------------------------------------------------------------------------------
+# Data volume seeding (kboot boards)
+# ---------------------------------------------------------------------------------------------
+#
+# /private/var is its own partition (disk0s2) that the kernel mounts over the rootfs's /private/var.  A real
+# restore fills it from the skeleton that ships inside the rootfs (db, log, run, root, mobile, tmp, lib, ...).
+# Left as a fresh mkfs.hfsplus it is empty: launchd cannot create /var/db/launchd.db, syslogd/configd/lockdownd/
+# SpringBoard have no home and the boot ends in a reboot loop.  So the volume is built here from the finished
+# rootfs (after the activation / guest-package / jailbreak edits, whose /private/var files then land on it too).
+
+DATA_MIB = 512              # the data partition's size, as the empty volume had
+VAR_REL = "private/var"     # the skeleton's place inside the rootfs
+
+
+def seed_var_tree(src_root, dst_root, image=None, log=print):
+    """Copy <src_root>/private/var into the directory dst_root (the root of the data volume): directories,
+    files, symlinks; owner, group, mode and times kept; a decmpfs-compressed file (0 bytes through the driver)
+    is decompressed on the way.  `image` is the raw volume behind src_root (see read_hfs_file).  Sockets, FIFOs
+    and devices are skipped.  var/run (0755) and var/tmp (1777) are created if the skeleton lacks them.
+    -> {"dirs": n, "files": n, "links": n, "decmpfs": n, "skipped": n}"""
+    src = os.path.join(src_root, VAR_REL)
+    if not os.path.isdir(src):
+        raise FirmwareError("the rootfs has no /%s to seed the data volume from" % VAR_REL)
+    n = {"dirs": 0, "files": 0, "links": 0, "decmpfs": 0, "skipped": 0}
+
+    def meta(st, dp, link=False):
+        try:
+            os.lchown(dp, st.st_uid, st.st_gid)      # before chmod: chown clears set-user-ID
+        except OSError:
+            pass                                     # not root (tests): the mode and times still copy
+        if not link:
+            os.chmod(dp, stat.S_IMODE(st.st_mode))
+        try:
+            os.utime(dp, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+
+    meta(os.lstat(src), dst_root)
+    for cur, dirs, files in os.walk(src):
+        rel_dir = os.path.relpath(cur, src)
+        out_dir = dst_root if rel_dir == "." else os.path.join(dst_root, rel_dir)
+        for name in sorted(dirs + files):
+            sp, dp = os.path.join(cur, name), os.path.join(out_dir, name)
+            st = os.lstat(sp)
+            if stat.S_ISLNK(st.st_mode):
+                os.symlink(os.readlink(sp), dp)
+                meta(st, dp, link=True)
+                n["links"] += 1
+            elif stat.S_ISDIR(st.st_mode):
+                os.mkdir(dp)
+                meta(st, dp)
+                n["dirs"] += 1
+            elif stat.S_ISREG(st.st_mode):
+                if st.st_size == 0:
+                    rel = os.path.normpath(os.path.join(VAR_REL, rel_dir, name))
+                    try:
+                        data, was_compressed = read_hfs_file(src_root, rel, image)
+                    except (OSError, FirmwareError, ValueError) as e:
+                        log("warning: /%s: could not read its compressed data (%s); copied as an empty file"
+                            % (rel, e))
+                        data, was_compressed = b"", False
+                    with open(dp, "wb") as f:
+                        f.write(data)
+                    n["decmpfs"] += 1 if was_compressed else 0
+                else:
+                    shutil.copyfile(sp, dp)
+                meta(st, dp)
+                n["files"] += 1
+            else:
+                n["skipped"] += 1
+    for d, mode in (("run", 0o755), ("tmp", 0o1777)):
+        full = os.path.join(dst_root, d)
+        if not os.path.isdir(full):
+            os.makedirs(full, exist_ok=True)
+            os.chmod(full, mode)
+            n["dirs"] += 1
+    return n
+
+
+def seed_data_volume(system_img, work, size_mib=DATA_MIB, log=print):
+    """A new case-sensitive HFS+ data volume image of size_mib MiB in `work`, filled from the /private/var of the
+    rootfs image `system_img` (mounted read-only; it is left as it is).  Needs root, mkfs.hfsplus and the
+    hfsplus module.  Not journaled: Linux cannot write a journaled volume (iOS mounts it fine).
+    -> (image path, seed_var_tree's counts)"""
+    require_root("seeding the data volume")
+    if not shutil.which("mkfs.hfsplus"):
+        raise FirmwareError("mkfs.hfsplus not found (apt-get install hfsprogs)")
+    img = os.path.join(work, "data.img")
+    with open(img, "wb") as f:
+        f.truncate(size_mib << 20)            # sparse: mkfs and the copy write only what they need
+    r = subprocess.run(["mkfs.hfsplus", "-s", "-v", "Data", img], capture_output=True, text=True)
+    if r.returncode:
+        raise FirmwareError("mkfs.hfsplus failed: " + (r.stderr.strip() or r.stdout.strip() or str(r.returncode)))
+    mnt_data, mnt_sys = os.path.join(work, "mnt_data"), os.path.join(work, "mnt_sys")
+
+    def into_data(dm):
+        return with_mounted(system_img, mnt_sys, lambda sm: seed_var_tree(sm, dm, system_img, log), rw=False)
+    try:
+        counts = with_mounted(img, mnt_data, into_data)
+    except OSError as e:
+        raise FirmwareError("seeding the data volume failed (%s); the %d MiB volume may be full" % (e, size_mib))
+    finally:
+        for d in (mnt_sys, mnt_data):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+    return img, counts
+
+
 def guest_package_kboot_rootfs(system_img, work, args, board, log=print):
     """The guest-package seed inside the extracted rootfs image of a kboot board.  Needs root + hfsplus."""
     mnt = os.path.join(work, "mnt_gp")
@@ -2719,6 +2832,23 @@ def create_kboot(args, entry, ipsw, ri, out, work):
     if getattr(args, "jailbreak", False):
         jailbreak_kboot_rootfs(system_img, int(entry.get("recipe", {}).get("system_mib", 1024)), work, args.jb_dir)
 
+    # 4d. the data volume (/private/var), seeded from the finished rootfs's /private/var skeleton, after every
+    #     rootfs edit above so their /private/var files land on it.  An empty volume does not boot (launchd cannot
+    #     create /var/db/launchd.db and reboots), so a build that cannot seed says so loudly.
+    data_img = None
+    if getattr(args, "skip_data_seed", False):
+        print("note: --skip-data-seed: the data volume is left empty (the device will NOT boot to SpringBoard)")
+    elif not shutil.which("mkfs.hfsplus"):
+        print("warning: mkfs.hfsplus not found: no data volume to seed (apt-get install hfsprogs)")
+    elif hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("warning: not root: the data volume is left empty and the device will NOT boot to SpringBoard "
+              "(rerun as root, or pass --skip-data-seed to silence this)")
+    else:
+        print("seeding the data volume from the rootfs's /private/var...")
+        data_img, seeded = seed_data_volume(system_img, work)
+        print("  /private/var: %(dirs)d directories, %(files)d files (%(decmpfs)d decompressed), %(links)d symlinks"
+              % seeded + ("; %d special files skipped" % seeded["skipped"] if seeded["skipped"] else ""))
+
     # 5. Build NAND store
     print("building NAND store...")
     nand_dir = os.path.join(out, "nand")
@@ -2741,7 +2871,7 @@ def create_kboot(args, entry, ipsw, ri, out, work):
     na.system = system_img
     na.kernelcache = os.path.join(dec_dir, "kernelcache.mach")
     na.kernel_version = None
-    na.data = "512m" if shutil.which("mkfs.hfsplus") else "none"
+    na.data = data_img or ("512m" if shutil.which("mkfs.hfsplus") else "none")
     na.s3 = None
     na.out = nand_dir
     na.force = True
@@ -3986,6 +4116,40 @@ def selftest(_args):
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # data volume seeding: the /private/var copy, over plain directories (no mounts, so no root needed)
+    d = tempfile.mkdtemp(prefix="fwk-seed-")
+    try:
+        root = os.path.join(d, "rootfs")
+        var = os.path.join(root, VAR_REL)
+        os.makedirs(os.path.join(var, "db/SystemConfiguration"))
+        os.makedirs(os.path.join(var, "mobile/Library/Preferences"))
+        os.makedirs(os.path.join(var, "empty"))
+        open(os.path.join(var, "mobile/Library/Preferences/a.plist"), "wb").write(b"<plist/>")
+        os.chmod(os.path.join(var, "mobile/Library/Preferences/a.plist"), 0o640)
+        open(os.path.join(var, "db/zero"), "wb").close()
+        os.symlink("db/zero", os.path.join(var, "link"))
+        os.mkfifo(os.path.join(var, "fifo"))
+        dst = os.path.join(d, "data")
+        os.mkdir(dst)
+        n = seed_var_tree(root, dst, log=lambda *_: None)
+        read = lambda p: open(os.path.join(dst, p), "rb").read()
+        check("seed var: directories, file bytes and mode, empty file, symlink",
+              os.path.isdir(os.path.join(dst, "db/SystemConfiguration")) and os.path.isdir(os.path.join(dst, "empty"))
+              and read("mobile/Library/Preferences/a.plist") == b"<plist/>"
+              and stat.S_IMODE(os.stat(os.path.join(dst, "mobile/Library/Preferences/a.plist")).st_mode) == 0o640
+              and read("db/zero") == b"" and os.readlink(os.path.join(dst, "link")) == "db/zero", str(n))
+        check("seed var: FIFOs skipped, var/run 0755 and var/tmp 1777 created",
+              n["skipped"] == 1 and not os.path.lexists(os.path.join(dst, "fifo"))
+              and stat.S_IMODE(os.stat(os.path.join(dst, "run")).st_mode) == 0o755
+              and stat.S_IMODE(os.stat(os.path.join(dst, "tmp")).st_mode) == 0o1777, str(n))
+        try:
+            seed_var_tree(os.path.join(d, "nowhere"), dst, log=lambda *_: None)
+            check("seed var: a rootfs without /private/var is an error", False)
+        except FirmwareError as e:
+            check("seed var: a rootfs without /private/var is an error", "private/var" in str(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     print("\nALL OK" if ok else "\nFAILURES")
     return 0 if ok else 1
 
@@ -4013,6 +4177,9 @@ def main():
                    help="skip mount-and-edit (m68ap/n45ap only; image will NOT boot as-is)")
     c.add_argument("--skip-activation", action="store_true",
                    help="leave lockdownd unpatched (m68ap/n45ap, and k48ap/n81ap/n90ap)")
+    c.add_argument("--skip-data-seed", action="store_true",
+                   help="kboot boards: leave the data volume (/private/var) empty instead of seeding it from the "
+                        "rootfs's /private/var (an empty one does not boot; for testing only)")
     c.add_argument("--jailbreak", action="store_true",
                    help="leave a jailbreak on the device: afc2 and Cydia with Substrate (iPhone OS 2.0+; needs root "
                         "and the hfsplus module; the K48 family and the other kboot boards boot with "

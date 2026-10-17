@@ -37,6 +37,23 @@ The modem only exists where the machine has one: /machine/baseband-modem (an iPh
 baseband=on, e.g. `-M iPhone-4,baseband=on`; the iPhone 2G has it by default).  Without it the Call / SMS /
 Network tabs are greyed out and say so; the Battery tab only needs the machine's battery-level property.
 
+The "Device" menu turns the emulated device itself, the way you would turn a real one: it sets the machine's
+accelerometer over QMP (`accel-orientation`, UIDeviceOrientation 1-6: portrait, landscape either way, upside down,
+face up / down), so the guest rotates its own UI and, on boards with a gyro (the iPad), the gyro sees the turn.
+"Shake" fires the machine's shake.  That is not View > Rotate view, which only turns the picture on the host.
+
+The "Power menu..." button (and the "Power" menu in the menu bar) is the device's power controls:
+
+  * Shut down safely   QMP `system_powerdown`: the machine does the real gesture (hold Power, slide to power off),
+                       iOS unmounts its volumes, and QEMU exits when the guest has halted;
+  * Shut down (forced) QMP `quit`: QEMU stops at once, like pulling the battery (unflushed writes are lost);
+  * Reboot safely      clean shutdown as above, then the machine is reset and resumed in place.  QEMU is switched to
+                       "pause on guest shutdown" (QMP `set-action`) for the duration so it survives the halt;
+                       manageFirm's QmpAgent, which normally quits QEMU on a guest shutdown, stands down meanwhile
+                       (a hold file next to the QMP socket, see reboot_hold_path());
+  * Reboot (forced)    QMP `system_reset` (+ `cont`): nothing is unmounted;
+  * Pause emulation    QMP `stop` / `cont`.
+
 Optional: Pillow (with ImageTk) gives smooth fit-to-window scaling and 90-degree view rotation (an iPad's
 landscape panel shows the portrait UI sideways).  Without it the screen is shown at 1:1, 1:2, 1:3 ... or 2:1.
 
@@ -341,6 +358,34 @@ def phone_caps(machine_props):
             "machine_props": names}
 
 
+# ---- device orientation (the machines' accel-orientation QOM property, UIDeviceOrientation) -----------
+ORIENTATIONS = (                                  # UIDeviceOrientation value, menu label
+    (1, "Portrait"), (4, "Landscape, Home on the left"), (3, "Landscape, Home on the right"),
+    (2, "Portrait, upside down"), (5, "Face up"), (6, "Face down"),
+)
+ORIENTATION_NAMES = dict(ORIENTATIONS)
+_TURN_CW = {1: 4, 4: 2, 2: 3, 3: 1}               # a quarter turn clockwise, seen from the front: Home swings left
+
+
+def turned_orientation(cur, clockwise=True):
+    """The orientation after a quarter turn of the device.  Face up / down (or anything unknown) stands up in portrait."""
+    if cur not in _TURN_CW:
+        return 1
+    if clockwise:
+        return _TURN_CW[cur]
+    return next(k for k, v in _TURN_CW.items() if v == cur)
+
+
+# ---- power controls ---------------------------------------------------------------------------------------
+REBOOT_HOLD_SUFFIX = ".reboot-pending"            # manageFirm.py's QmpAgent looks for <qmp socket> + this
+
+
+def reboot_hold_path(qmp_sock):
+    """The file that exists while a safe reboot is in progress: it tells manageFirm's QmpAgent not to quit QEMU
+    when the guest's SHUTDOWN arrives (the panel is about to reset the machine instead)."""
+    return qmp_sock + REBOOT_HOLD_SUFFIX
+
+
 # ---------------------------------------------------------------------------------------------
 # QMP client
 # ---------------------------------------------------------------------------------------------
@@ -536,6 +581,93 @@ class QMPClient:
             pass
 
 
+class PowerControl:
+    """The power menu's actions over QMP, without any GUI.  Every method blocks until it is done and returns a
+    one-line outcome for the status bar; a failure raises QMPError.  Feed every QMP event name to on_event()."""
+
+    SAFE_WAIT_S = 300.0                # how long a safe reboot waits for the guest to finish shutting down
+
+    def __init__(self, qmp, hold_path=None):
+        self.qmp, self.hold_path = qmp, hold_path
+        self.shutdown_seen = threading.Event()
+
+    def on_event(self, name):
+        if name == "SHUTDOWN":
+            self.shutdown_seen.set()
+
+    def shutdown_safe(self):
+        self.qmp.execute("system_powerdown")
+        return "Power-off requested: the guest is shutting down (QEMU exits when it has halted)"
+
+    def shutdown_forced(self):
+        try:
+            self.qmp.execute("quit", timeout=3.0)
+        except QMPError:
+            if not self.qmp.closed:          # QEMU may close the socket before the reply is read; that is success
+                raise
+        return "QEMU stopped (forced shutdown)"
+
+    def reboot_forced(self):
+        self.qmp.execute("system_reset")
+        self._resume_after_reset()
+        return "Reset sent: the device is restarting (nothing was unmounted)"
+
+    def reboot_safe(self, wait=None, progress=None):
+        """Clean shutdown, then reset and resume the same QEMU.  QEMU is told to pause (not exit) on the guest's
+        shutdown while this runs; the guest's halt is the SHUTDOWN event."""
+        wait = self.SAFE_WAIT_S if wait is None else wait
+        self.qmp.execute("set-action", {"shutdown": "pause"})
+        self.shutdown_seen.clear()
+        self._hold(True)
+        try:
+            self.qmp.execute("system_powerdown")
+            if progress:
+                progress("Reboot: waiting for the guest to shut down cleanly…")
+            deadline = time.monotonic() + wait
+            while not self.shutdown_seen.wait(0.25):
+                if self.qmp.closed:
+                    raise QMPError("QEMU exited before the guest could be restarted")
+                if time.monotonic() > deadline:
+                    raise QMPError("the guest did not shut down within %d s; reboot cancelled" % wait)
+            self.qmp.execute("system_reset")
+            self._resume_after_reset()
+        finally:
+            self._set_shutdown_action("poweroff")           # whatever happened, a later shutdown ends QEMU again
+            self._hold(False)
+        return "Rebooted after a clean shutdown"
+
+    def _set_shutdown_action(self, action):
+        try:
+            self.qmp.execute("set-action", {"shutdown": action})
+        except QMPError:
+            pass
+
+    def _resume_after_reset(self, wait=5.0):
+        """A reset leaves a machine that was paused / shut down (not running) in the pre-launch state; resume it."""
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            status = (self.qmp.execute("query-status") or {}).get("status")
+            if status == "running":
+                return True
+            if status in ("prelaunch", "paused"):
+                self.qmp.execute("cont")
+                return True
+            time.sleep(0.1)                                 # still "shutdown": the reset has not been processed yet
+        return False
+
+    def _hold(self, on):
+        if not self.hold_path:
+            return
+        try:
+            if on:
+                with open(self.hold_path, "w"):
+                    pass
+            else:
+                os.remove(self.hold_path)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------------------------
 # frame grabber
 # ---------------------------------------------------------------------------------------------
@@ -645,6 +777,9 @@ def _gui_main(args, run=True):
             self.qmp = QMPClient(args.qmp, on_event=self._on_event, on_close=self._on_qmp_close,
                                  on_error=lambda c, t: self._status_q.put(("warn", "%s: %s" % (c, t))))
             self.grabber = None
+            self._power = PowerControl(self.qmp, reboot_hold_path(args.qmp))
+            self._power_busy = False
+            self._has_accel = None                   # does /machine have accel-orientation?  None until probed
             self._build()
             self._set_status("Waiting for QEMU…")
             threading.Thread(target=self._connect, daemon=True).start()
@@ -677,6 +812,31 @@ def _gui_main(args, run=True):
             view.add_checkbutton(label="Serial log", variable=self._serial_var, command=self._serial_toggle,
                                  state="normal" if args.serial_log else "disabled")
             menubar.add_cascade(label="View", menu=view)
+
+            device = tk.Menu(menubar, tearoff=0)       # turns the emulated device (accelerometer), not the view
+            self._orient_var = tk.IntVar(value=0)
+            om = tk.Menu(device, tearoff=0)
+            for val, label in ORIENTATIONS:
+                om.add_radiobutton(label=label, value=val, variable=self._orient_var,
+                                   command=lambda v=val: self._orient(target=v))
+            device.add_cascade(label="Orientation", menu=om)
+            device.add_command(label="Turn clockwise", command=lambda: self._orient(clockwise=True))
+            device.add_command(label="Turn counter-clockwise", command=lambda: self._orient(clockwise=False))
+            device.add_separator()
+            device.add_command(label="Shake", command=lambda: self._machine("accel-shake", True, "Device shaken"))
+            menubar.add_cascade(label="Device", menu=device)
+
+            self._paused_var = tk.BooleanVar(value=False)
+            pm = tk.Menu(menubar, tearoff=0)           # also popped up by the side "Power menu…" button
+            pm.add_command(label="Shut down safely", command=lambda: self._power_do("shutdown-safe"))
+            pm.add_command(label="Shut down (forced)…", command=lambda: self._power_do("shutdown-forced"))
+            pm.add_separator()
+            pm.add_command(label="Reboot safely", command=lambda: self._power_do("reboot-safe"))
+            pm.add_command(label="Reboot (forced)…", command=lambda: self._power_do("reboot-forced"))
+            pm.add_separator()
+            pm.add_checkbutton(label="Pause emulation", variable=self._paused_var, command=self._toggle_pause)
+            self._power_menu = pm
+            menubar.add_cascade(label="Power", menu=pm)
             self.config(menu=menubar)
 
             body = ttk.Frame(self, padding=4)
@@ -708,6 +868,8 @@ def _gui_main(args, run=True):
             ttk.Separator(side).pack(fill="x", pady=6)
             ttk.Button(side, text="Screenshot", width=8, command=self._screenshot).pack(fill="x", pady=3)
             ttk.Button(side, text="Phone…", width=8, command=self._open_phone).pack(fill="x", pady=3)
+            self._power_btn = ttk.Button(side, text="Power menu…", width=11, command=self._show_power_menu)
+            self._power_btn.pack(fill="x", pady=3)
             self._status = ttk.Label(self, text="", anchor="w", padding=(6, 2), foreground="#555555")
             self._status.pack(fill="x", side="bottom")
 
@@ -806,8 +968,11 @@ def _gui_main(args, run=True):
             self._status.configure(text=self._status_text + extra)
 
         def _on_event(self, name):
+            self._power.on_event(name)
             if name in ("SHUTDOWN", "POWERDOWN"):
                 self._status_q.put(("info", "Guest %s" % name.lower()))
+            elif name in ("STOP", "RESUME"):
+                self._status_q.put(("paused", name == "STOP"))
 
         def _on_qmp_close(self):
             self._status_q.put(("closed", "QEMU exited"))
@@ -819,6 +984,7 @@ def _gui_main(args, run=True):
                 self._status_q.put(("fatal", str(e)))
                 return
             self._status_q.put(("connected", "Connected"))
+            threading.Thread(target=self._probe_accel, daemon=True).start()
             self.grabber = FrameGrabber(self.qmp, self._on_frame, fps=args.fps,
                                         on_error=lambda t: self._status_q.put(("warn", t)))
             self.grabber.start()
@@ -853,6 +1019,10 @@ def _gui_main(args, run=True):
                         lab = self._phone_ui.get("callstate")
                         if lab is not None and self._phone_win is not None:
                             lab.configure(text="Call state: %s" % text)
+                    elif kind == "orient":
+                        self._orient_var.set(text)             # `text` is the UIDeviceOrientation here
+                    elif kind == "paused":
+                        self._paused_var.set(text)             # ... and a bool here
                     else:
                         self._set_status(text)
             except queue.Empty:
@@ -1050,6 +1220,93 @@ def _gui_main(args, run=True):
                     self.grabber.kick()
             except QMPError as ex:
                 self._set_status("Not sent: %s" % ex)
+
+        # -- device orientation (accelerometer) ------------------------------------
+        def _probe_accel(self):
+            """Worker thread: does this machine have the accelerometer control, and which way is it turned now?"""
+            try:
+                self._has_accel = "accel-orientation" in self.qmp.qom_names(MACHINE_PATH)
+                if self._has_accel:
+                    cur = self.qmp.qom_get(MACHINE_PATH, "accel-orientation")
+                    if isinstance(cur, int):
+                        self._status_q.put(("orient", cur))
+            except QMPError:
+                pass
+
+        def _orient(self, target=None, clockwise=True):
+            """Turn the device: to `target` (UIDeviceOrientation 1-6), or a quarter turn from where it is now."""
+            if self._has_accel is False:
+                self._set_status("This machine has no accelerometer to turn (no accel-orientation property)")
+                return
+
+            def work():
+                try:
+                    new = target
+                    if new is None:
+                        new = turned_orientation(self.qmp.qom_get(MACHINE_PATH, "accel-orientation"), clockwise)
+                    self.qmp.qom_set(MACHINE_PATH, "accel-orientation", int(new))
+                    if self.grabber:
+                        self.grabber.kick(3.0)             # the guest redraws rotated: poll the screen fast for a while
+                    self._status_q.put(("orient", int(new)))
+                    self._status_q.put(("info", "Device turned: %s" % ORIENTATION_NAMES.get(new, new)))
+                except QMPError as ex:
+                    self._status_q.put(("warn", "Orientation: %s" % ex))
+            threading.Thread(target=work, daemon=True).start()
+
+        # -- power menu ---------------------------------------------------------------
+        def _show_power_menu(self):
+            b = self._power_btn
+            try:
+                self._power_menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+            finally:
+                self._power_menu.grab_release()
+
+        def _power_do(self, kind):
+            if not self._connected:
+                self._set_status("Power: not connected to QEMU yet")
+                return
+            if self._power_busy:
+                self._set_status("Power: the previous power action is still running")
+                return
+            label = {"shutdown-safe": "Shut down", "shutdown-forced": "Forced shutdown",
+                     "reboot-safe": "Reboot", "reboot-forced": "Forced reboot"}[kind]
+            warn = {"shutdown-forced": "This stops QEMU immediately, like pulling the battery.  Anything the guest "
+                                       "has not written out yet (HFS+ directory updates in particular) is lost.\n\n"
+                                       "\"Shut down safely\" unmounts first.",
+                    "reboot-forced": "This resets the device immediately without shutting iOS down.  Anything "
+                                     "the guest has not written out yet is lost.\n\n\"Reboot safely\" unmounts first."}
+            if kind in warn and not messagebox.askokcancel(label, warn[kind], icon="warning", parent=self):
+                return
+            actions = {"shutdown-safe": self._power.shutdown_safe,
+                       "shutdown-forced": self._power.shutdown_forced,
+                       "reboot-safe": lambda: self._power.reboot_safe(
+                           progress=lambda t: self._status_q.put(("info", t))),
+                       "reboot-forced": self._power.reboot_forced}
+            self._power_busy = True
+            self._set_status("%s…" % label)
+
+            def work():
+                try:
+                    self._status_q.put(("info", actions[kind]()))
+                except QMPError as ex:
+                    self._status_q.put(("warn", "%s: %s" % (label, ex)))
+                finally:
+                    self._power_busy = False
+                    if self.grabber:
+                        self.grabber.kick(3.0)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _toggle_pause(self):
+            cmd = "stop" if self._paused_var.get() else "cont"
+
+            def work():
+                try:
+                    self.qmp.execute(cmd)
+                    self._status_q.put(("info", "Emulation paused" if cmd == "stop" else "Emulation resumed"))
+                except QMPError as ex:
+                    self._status_q.put(("warn", "%s: %s" % (cmd, ex)))
+                    self._status_q.put(("paused", cmd != "stop"))     # the command failed: undo the tick
+            threading.Thread(target=work, daemon=True).start()
 
         # -- phone window: fake call / SMS, carrier, battery ---------------------
         def _qom_async(self, path, prop, value, ok=None):
@@ -1421,6 +1678,10 @@ class _FakeQEMU(threading.Thread):
         self.qom_tree = {"/machine": ["battery-level", "usb-attached", "baseband-modem", "battery-charging"]}
         self.qom_vals = {("/machine", "battery-level"): 80, ("/machine/baseband-modem", "call-state"): "idle"}
         self.shade = 0
+        self.cmds = []                       # (command, arguments) of everything received, in order
+        self.status = None                   # query-status's run state; None answers {} like a bare fake
+        self.shutdown_on_powerdown = False   # system_powerdown halts the guest: SHUTDOWN event, "shutdown" state
+        self.hold_path, self.hold_at_powerdown = None, None
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(path)
         self.srv.listen(1)
@@ -1435,6 +1696,8 @@ class _FakeQEMU(threading.Thread):
         for line in f:
             req = json.loads(line)
             rid, cmd, a = req.get("id"), req["execute"], req.get("arguments", {})
+            self.cmds.append((cmd, a))
+            halted = False
             if cmd in self.errors_for:
                 out = {"error": {"class": "GenericError", "desc": "no such thing"}}
             elif cmd == "input-send-event":
@@ -1457,13 +1720,27 @@ class _FakeQEMU(threading.Thread):
                 with open(a["filename"], "wb") as g:
                     g.write(b"P6\n# fake\n%d %d\n255\n" % (self.w, self.h) + px)
                 out = {"return": {}}
+            elif cmd == "query-status":
+                out = {"return": {} if self.status is None else {"status": self.status, "running": self.status == "running"}}
+            elif cmd == "system_powerdown":
+                self.hold_at_powerdown = os.path.exists(self.hold_path) if self.hold_path else None
+                halted = self.shutdown_on_powerdown
+                if halted:
+                    self.status = "shutdown"
+                out = {"return": {}}
+            elif cmd == "system_reset":
+                self.status = "prelaunch"
+                out = {"return": {}}
+            elif cmd == "cont":
+                self.status = "running"
+                out = {"return": {}}
             else:
                 out = {"return": {}}
             if rid is not None:
                 out["id"] = rid
             f.write((json.dumps(out) + "\r\n").encode())
             f.flush()
-            if cmd == "x-event":
+            if cmd == "x-event" or halted:
                 f.write(b'{"event":"SHUTDOWN","data":{},"timestamp":{"seconds":1,"microseconds":0}}\r\n')
                 f.flush()
 
@@ -1553,6 +1830,21 @@ def selftest():
     check("signal presets stay inside the slider range",
           all(SIGNAL_MIN_DBM <= d <= SIGNAL_MAX_DBM for _, d in SIGNAL_PRESETS))
 
+    # device orientation
+    check("orientations: UIDeviceOrientation 1-6, each once",
+          sorted(v for v, _ in ORIENTATIONS) == [1, 2, 3, 4, 5, 6] and len(ORIENTATION_NAMES) == 6)
+    seq = [1]
+    for _ in range(4):
+        seq.append(turned_orientation(seq[-1], True))
+    check("turned_orientation: clockwise from portrait the Home button swings left, a full circle returns",
+          seq == [1, 4, 2, 3, 1], seq)
+    check("turned_orientation: counter-clockwise undoes clockwise from every upright orientation",
+          all(turned_orientation(turned_orientation(o, True), False) == o for o in (1, 2, 3, 4)))
+    check("turned_orientation: face up / face down / unknown stand up in portrait",
+          [turned_orientation(o, cw) for o in (0, 5, 6, None, "x") for cw in (True, False)] == [1] * 10)
+    check("reboot_hold_path sits next to the QMP socket (manageFirm.py uses the same name)",
+          reboot_hold_path("/tmp/qemu-ios-panel-x/qmp.sock") == "/tmp/qemu-ios-panel-x/qmp.sock.reboot-pending")
+
     # PPM
     pix = bytes(range(24))
     check("parse_ppm with a comment", parse_ppm(b"P6\n# hi\n4 2\n255\n" + pix) == (4, 2, 16))
@@ -1628,8 +1920,11 @@ def selftest():
     srv.start()
     seen_events, closed, errs = [], threading.Event(), []
     try:
-        c = QMPClient(sock, on_event=seen_events.append, on_close=closed.set, on_error=lambda a, b: errs.append((a, b)))
+        pc = PowerControl(None, os.path.join(d, "q.sock.reboot-pending"))
+        c = QMPClient(sock, on_event=lambda n: (seen_events.append(n), pc.on_event(n)), on_close=closed.set,
+                      on_error=lambda a, b: errs.append((a, b)))
         c.connect(timeout=5)
+        pc.qmp = c
         check("QMP: handshake and a command with a reply", c.execute("query-status") == {})
         c.input_events([key_event("h", True)])
         c.input_events([key_event("h", False)])
@@ -1661,6 +1956,54 @@ def selftest():
             check("QMP: qom_get of a missing property raises", False)
         except QMPError:
             check("QMP: qom_get of a missing property raises", True)
+
+        # power controls
+        def sent(*names):
+            return [(n, a) for n, a in srv.cmds if n in names]
+        srv.cmds.clear()
+        pc.shutdown_safe()
+        check("power: safe shutdown is system_powerdown and nothing else", [n for n, _ in srv.cmds] == ["system_powerdown"],
+              srv.cmds)
+        srv.cmds.clear()
+        pc.shutdown_forced()
+        check("power: forced shutdown is quit", [n for n, _ in srv.cmds] == ["quit"], srv.cmds)
+        srv.cmds.clear()
+        srv.status = "running"
+        pc.reboot_forced()
+        check("power: forced reboot is system_reset, then cont once the reset left the VM stopped",
+              [n for n, _ in sent("system_reset", "cont")] == ["system_reset", "cont"] and srv.status == "running",
+              srv.cmds)
+        srv.cmds.clear()
+        srv.hold_path, srv.shutdown_on_powerdown, srv.status = pc.hold_path, True, "running"
+        msg = pc.reboot_safe(wait=5.0)
+        check("power: safe reboot = pause-on-shutdown, powerdown, halt seen, reset, cont, then poweroff again",
+              sent("set-action", "system_powerdown", "system_reset", "cont")
+              == [("set-action", {"shutdown": "pause"}), ("system_powerdown", {}), ("system_reset", {}),
+                  ("cont", {}), ("set-action", {"shutdown": "poweroff"})]
+              and srv.status == "running" and msg.startswith("Rebooted"), srv.cmds)
+        check("power: safe reboot holds manageFirm's agent off during the halt and releases it afterwards",
+              srv.hold_at_powerdown is True and not os.path.exists(pc.hold_path), srv.hold_at_powerdown)
+        check("power: safe reboot leaves QEMU exiting on a later guest shutdown",
+              sent("set-action")[-1] == ("set-action", {"shutdown": "poweroff"}))
+        srv.cmds.clear()
+        srv.shutdown_on_powerdown, srv.status = False, "running"
+        try:
+            pc.reboot_safe(wait=0.6)
+            check("power: safe reboot gives up when the guest never halts", False)
+        except QMPError as e:
+            check("power: safe reboot gives up when the guest never halts",
+                  "reboot cancelled" in str(e) and not sent("system_reset")
+                  and sent("set-action")[-1] == ("set-action", {"shutdown": "poweroff"})
+                  and not os.path.exists(pc.hold_path), (e, srv.cmds))
+        srv.errors_for.add("set-action")
+        srv.cmds.clear()
+        try:
+            pc.reboot_safe(wait=0.6)
+            check("power: safe reboot refuses, without powering down, when QEMU cannot pause on shutdown", False)
+        except QMPError:
+            check("power: safe reboot refuses, without powering down, when QEMU cannot pause on shutdown",
+                  not sent("system_powerdown") and not os.path.exists(pc.hold_path), srv.cmds)
+        srv.errors_for.discard("set-action")
 
         frames = []
         g = FrameGrabber(c, lambda w, h, data, off: frames.append((w, h, len(data) - off)), fps=60)
