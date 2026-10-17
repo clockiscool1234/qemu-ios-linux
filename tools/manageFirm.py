@@ -1374,6 +1374,24 @@ class CreateDeviceDialog(tk.Toplevel):
         self._jb_hint.grid(row=row, column=1, columnspan=2, **P)
         row += 1
 
+        # Guest package + No GLES
+        ttk.Label(f, text="Guest package:").grid(row=row, column=0, **P)
+        self._gp_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self._gp_var, width=36).grid(row=row, column=1, **P)
+        ttk.Button(f, text="Browse\u2026", command=self._browse_gp).grid(row=row, column=2, **P)
+        row += 1
+        self._no_gles = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            f, text="No GLES (leave the GL hooks out of the guest package)",
+            variable=self._no_gles).grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+        ttk.Label(f, text="Optional .itpack (contrib/guest-package/build.sh) baked into the rootfs; needs root and the "
+                          "hfsplus module. Not used by the iPod touch 2G. With No GLES the OpenGLES front end and "
+                          "the MBX shim stay out (firmwarekit --no-gles).",
+                  foreground="gray", wraplength=420, justify="left").grid(
+            row=row, column=1, columnspan=2, **P)
+        row += 1
+
         # Status label + progress bar
         self._status_var = tk.StringVar(value="Ready.")
         ttk.Label(fixed, textvariable=self._status_var,
@@ -1486,6 +1504,12 @@ class CreateDeviceDialog(tk.Toplevel):
         self._ipsw_entry.configure(state="normal" if is_browse else "disabled")
         self._ipsw_brow.configure(state="normal" if is_browse else "disabled")
 
+    def _browse_gp(self) -> None:
+        p = filedialog.askopenfilename(parent=self, title="Select a guest package",
+                                       filetypes=[("Guest package", "*.itpack"), ("All files", "*")])
+        if p:
+            self._gp_var.set(p)
+
     def _browse_ipsw(self) -> None:
         p = filedialog.askopenfilename(
             parent=self, title="Select IPSW",
@@ -1589,6 +1613,8 @@ class CreateDeviceDialog(tk.Toplevel):
 
         self._create_btn.configure(state="disabled")
         self._jb_requested = bool(self._jailbreak.get())    # read here: Tk vars belong to this thread
+        self._no_gles_requested = bool(self._no_gles.get())
+        self._gp_requested = self._gp_var.get().strip()
 
         if self._ipsw_mode.get() == "browse":
             ipsw = self._ipsw_var.get().strip()
@@ -1746,10 +1772,15 @@ class CreateDeviceDialog(tk.Toplevel):
         if bootrom and dev.get("needs_bootrom"):
             # firmwarekit copies it into the device folder; run.sh uses that copy
             cmd += ["--bootrom", os.path.abspath(os.path.expanduser(bootrom))]
+        gp = getattr(self, "_gp_requested", "")
+        if gp and board != "n72ap":
+            cmd += ["--guest-package", os.path.abspath(os.path.expanduser(gp))]
+            if getattr(self, "_no_gles_requested", False):
+                cmd += ["--no-gles"]
         jailbreak = bool(getattr(self, "_jb_requested", False))
         if jailbreak:
             cmd += ["--jailbreak"]
-        if dev.get("needs_sudo") or jailbreak:      # the jailbreak edits the loop-mounted rootfs
+        if dev.get("needs_sudo") or jailbreak or (gp and board != "n72ap"):      # the jailbreak edits the loop-mounted rootfs
             cmd = self._as_root(cmd)
 
         try:

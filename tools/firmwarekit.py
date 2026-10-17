@@ -2491,8 +2491,8 @@ def create_img3(args, entry, ipsw, ri, out, work):
     into a 1 MiB NOR (IMG2 superblock, SysCfg, images at 0x8000 with SHSH wrapped under the emulated UID,
     nvram at 0xfc000: imgtools/build_nor.py, FirmwareKit's N72NOR) and write the iBoot the machine enters.
 
-    Not done: the system volume and the NAND page store (FirmwareKit's N72NAND: imgtools/build_nand.py), so
-    run.sh still needs a nand/ directory made by it."""
+    The system volume and NAND page store come from tools/n72_nand.py (Linux port of imgtools/build_nand.py;
+    needs root and the hfsplus module); --skip-nand leaves nand/ out."""
     board = ri["board"]
     qemu_machine, tmp_prefix, nand_banks, bbt_map, _ = BOARD_META[board]
     major = int((ri["version"].split(".")[0] or "0"))
@@ -2549,6 +2549,9 @@ def create_img3(args, entry, ipsw, ri, out, work):
         install_bootrom(args.bootrom_path, board, out)
     else:
         print("note: no --bootrom given; run.sh will need $BOOTROM (or %s in this folder)" % BOOTROMS[board][1])
+    if not getattr(args, "skip_nand", False):
+        import n72_nand
+        n72_nand.build(args.ipsw, entry, ri, out, work)
     run_body = SH_DIR_LINE
     run_body += _cleanup_trap(tmp_prefix)
     run_body += bootrom_guard(board)
@@ -2557,10 +2560,13 @@ def create_img3(args, entry, ipsw, ri, out, work):
   -serial mon:stdio -display sdl,show-cursor=on -audio driver=none
 """ % (qemu_machine, ',direct-iboot="$D/iBoot.bin"' if iboot_out else "")
     _write_run_sh(os.path.join(out, "run.sh"), run_body)
-    print("""
+    if getattr(args, "skip_nand", False):
+        print("""
 done: %s
-nor.bin%s written.  The system volume and the NAND page store are not built here yet (N72NAND; see
-imgtools/build_nand.py): run.sh expects a nand/ directory next to it.""" % (out, " and iBoot.bin" if iboot_out else ""))
+nor.bin%s written.  --skip-nand: the NAND page store is not built (imgtools/build_nand.py makes one):
+run.sh expects a nand/ directory next to it.""" % (out, " and iBoot.bin" if iboot_out else ""))
+    else:
+        print("\ndone: %s\nnor.bin%s and nand/ written." % (out, " and iBoot.bin" if iboot_out else ""))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3805,6 +3811,7 @@ def selftest(_args):
         class A: pass
         a = A()
         a.seed, a.id, a.wifi_mac, a.bootrom_path, a.ipsw = None, "n72ap-test", None, src, "unused.ipsw"
+        a.skip_nand = True      # the NAND step needs a real rootfs, root and the hfsplus module
         out = os.path.join(d, "n72")
         os.makedirs(out)
         import contextlib, io
@@ -4016,6 +4023,8 @@ def main():
     c.add_argument("--bootrom", metavar="PATH",
                    help="bootrom file for boards that boot through one (m68ap/n45ap: S5L8900, n72ap: S5L8720); "
                         "copied into --out as bootrom_<soc> and used by run.sh. Ignored for the other boards")
+    c.add_argument("--skip-nand", action="store_true",
+                   help="n72ap: stop after nor.bin/iBoot.bin and do not build nand/ (the old behaviour)")
     c.add_argument("--qemu", help="path to qemu-system-arm binary")
     c.add_argument("--helper", help="path to it_keybag binary for iOS 4.x keybag provisioning")
     c.add_argument("--skip-keybag", action="store_true",
