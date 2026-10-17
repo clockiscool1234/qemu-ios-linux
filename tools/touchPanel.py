@@ -19,6 +19,12 @@ Usage (QEMU started with `-qmp unix:/tmp/dev.sock,server,nowait`; manageFirm.py 
 
 Closing the panel does not stop QEMU; buttons held at that moment are released.
 
+The pane beside the screen ("View > Serial log") shows the guest's serial output, the verbose kernel / boot log.
+manageFirm.py has the --exec-qemu wrapper tee the serial port into a file (LT_SERIAL_LOG) and passes it here as
+--serial-log; the panel tails the file and fixes the line breaks (iOS's \r\n / \n\r\n / \r\r\n all become one),
+strips escape sequences, keeps the last 5000 lines, and can Clear or Save them.  Without --serial-log the pane
+is off.
+
 The "Phone..." button opens a second window that drives the fake cellular modem and the battery over QMP
 `qom-set` (no guest software involved, the guest just sees a baseband / PMU that changed):
 
@@ -40,9 +46,11 @@ window) to a bundle's run.sh without editing it; see exec_qemu().
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import sys
@@ -149,9 +157,14 @@ def scale_to_ratio(s):
     return 1, sub
 
 
-def build_qemu_args(args, qmp_sock=None, hide_display=False):
+def build_qemu_args(args, qmp_sock=None, hide_display=False, serial_log=None):
     """The launcher hook's argument edit: add our own QMP socket, and optionally replace the display with
-    `-display none` (the panel is the screen).  Existing monitors and sockets are left alone."""
+    `-display none` (the panel is the screen).  Existing monitors and sockets are left alone.
+
+    With `serial_log`, the usual `-serial mon:stdio` is rebuilt as the same thing spelled out (a muxed stdio
+    chardev carrying the serial port and the monitor) plus `logfile=PATH`, so everything the guest writes to its
+    serial port is also appended to that file; the panel's serial pane tails it.  Anything else on the
+    command line (another -serial, no -serial at all) is left alone and the pane just stays empty."""
     out = list(args)
     if hide_display:
         kept, i = [], 0
@@ -162,6 +175,17 @@ def build_qemu_args(args, qmp_sock=None, hide_display=False):
             kept.append(out[i])
             i += 1
         out = kept + ["-display", "none"]
+    if serial_log:
+        kept, i = [], 0
+        while i < len(out):
+            if out[i] in ("-serial", "--serial") and i + 1 < len(out) and out[i + 1] == "mon:stdio":
+                kept += ["-chardev", "stdio,id=ltserial,mux=on,logfile=%s" % serial_log.replace(",", ",,"),
+                         "-serial", "chardev:ltserial", "-mon", "chardev=ltserial,mode=readline"]
+                i += 2
+                continue
+            kept.append(out[i])
+            i += 1
+        out = kept
     if qmp_sock:
         out += ["-qmp", "unix:%s,server,nowait" % qmp_sock.replace(",", ",,")]
     return out
@@ -169,13 +193,95 @@ def build_qemu_args(args, qmp_sock=None, hide_display=False):
 
 def exec_qemu(argv):
     """`--exec-qemu ARGS...`: replace this process with the real QEMU (LT_REAL_QEMU), same arguments plus the
-    edits above (LT_QMP_SOCK, LT_HIDE_DISPLAY=1).  A bundle's run.sh runs `$QEMU -M ...`; manageFirm.py points
-    QEMU at a one-line shell wrapper that runs this."""
+    edits above (LT_QMP_SOCK, LT_HIDE_DISPLAY=1, LT_SERIAL_LOG).  A bundle's run.sh runs `$QEMU -M ...`;
+    manageFirm.py points QEMU at a one-line shell wrapper that runs this."""
     real = os.environ.get("LT_REAL_QEMU")
     if not real:
         sys.exit("touchPanel: --exec-qemu needs LT_REAL_QEMU")
-    args = build_qemu_args(argv, os.environ.get("LT_QMP_SOCK"), os.environ.get("LT_HIDE_DISPLAY") == "1")
+    args = build_qemu_args(argv, os.environ.get("LT_QMP_SOCK"), os.environ.get("LT_HIDE_DISPLAY") == "1",
+                           os.environ.get("LT_SERIAL_LOG"))
     os.execv(real, [real] + args)
+
+
+# ---- serial log (the pane beside the screen) ---------------------------------------------------------
+SERIAL_MAX_LINES = 5000                                   # lines kept in the pane
+SERIAL_PARTIAL_FLUSH_S = 0.4                              # show an unfinished line (a prompt) after this long
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-Z\\-_]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")        # control characters except tab (\n and \r are split on)
+_EOL_RE = re.compile(r"[\r\n]+")
+
+
+class SerialCleaner:
+    """Turns the raw bytes of a guest's serial port into clean text lines.
+
+    iOS writes \\r\\n, \\n\\r\\n or a bare \\r depending on the code path, and a terminal that converts each of
+    those separately shows doubled newlines.  Here every run of \\r and \\n is one line break, escape sequences
+    and other control characters are dropped, and invalid UTF-8 is replaced instead of raising.  Bytes may arrive
+    in any chunking: feed() returns only the lines completed so far, flush() hands back the unfinished one."""
+
+    def __init__(self):
+        self._dec = codecs.getincrementaldecoder("utf-8")("replace")
+        self._buf = ""
+
+    @staticmethod
+    def clean(text):
+        return _CTRL_RE.sub("", _ANSI_RE.sub("", text)).rstrip()
+
+    def feed(self, data):
+        self._buf += self._dec.decode(data)
+        parts = _EOL_RE.split(self._buf)
+        self._buf = parts.pop()                           # "" when the chunk ended on a line break
+        out = []
+        for p in parts:
+            p = self.clean(p)
+            if p:
+                out.append(p)
+        return out
+
+    def flush(self):
+        line, self._buf = self.clean(self._buf), ""
+        return [line] if line else []
+
+
+class SerialTail(threading.Thread):
+    """Follows the serial log file QEMU writes (see build_qemu_args) and calls on_lines(list_of_str) with each
+    batch of cleaned lines.  The file may not exist yet when the panel starts; it is waited for."""
+
+    def __init__(self, path, on_lines):
+        super().__init__(name="serial-tail", daemon=True)
+        self.path, self.on_lines = path, on_lines
+        self.stop_ev = threading.Event()
+
+    def run(self):
+        cleaner = SerialCleaner()
+        f = None
+        idle_since = None
+        try:
+            while not self.stop_ev.is_set():
+                if f is None:
+                    try:
+                        f = open(self.path, "rb")
+                    except OSError:
+                        self.stop_ev.wait(0.2)
+                        continue
+                data = f.read(65536)
+                if data:
+                    idle_since = None
+                    lines = cleaner.feed(data)
+                    if lines:
+                        self.on_lines(lines)
+                    continue
+                if idle_since is None:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= SERIAL_PARTIAL_FLUSH_S:
+                    lines = cleaner.flush()
+                    if lines:
+                        self.on_lines(lines)
+                    idle_since = None
+                self.stop_ev.wait(0.1)
+        finally:
+            if f is not None:
+                f.close()
 
 
 # ---- phone controls (QOM paths and value rules mirror hw/misc/ios_baseband.c) ----------------------
@@ -533,6 +639,9 @@ def _gui_main(args, run=True):
             self._phone = None                       # phone_caps() of this machine, once probed
             self._phone_ui = {}
             self._callstate_busy = False
+            self._serial_q = queue.Queue()           # cleaned serial lines from the tail thread
+            self._serial_tail = None
+            self._serial_visible = False
             self.qmp = QMPClient(args.qmp, on_event=self._on_event, on_close=self._on_qmp_close,
                                  on_error=lambda c, t: self._status_q.put(("warn", "%s: %s" % (c, t))))
             self.grabber = None
@@ -564,16 +673,24 @@ def _gui_main(args, run=True):
             self._top_var = tk.BooleanVar(value=False)
             view.add_checkbutton(label="Always on top", variable=self._top_var,
                                  command=lambda: self.attributes("-topmost", self._top_var.get()))
+            self._serial_var = tk.BooleanVar(value=bool(args.serial_log))
+            view.add_checkbutton(label="Serial log", variable=self._serial_var, command=self._serial_toggle,
+                                 state="normal" if args.serial_log else "disabled")
             menubar.add_cascade(label="View", menu=view)
             self.config(menu=menubar)
 
             body = ttk.Frame(self, padding=4)
             body.pack(fill="both", expand=True)
+            self._body = body
             side = ttk.Frame(body)
             side.pack(side="right", fill="y", padx=(6, 0))
+            self._serial_frame = ttk.Frame(body)     # packed beside the screen by _serial_toggle()
+            self._build_serial(self._serial_frame)
             self.canvas = tk.Canvas(body, width=360, height=480, bg="#101010", highlightthickness=0,
                                     cursor="circle")
             self.canvas.pack(side="left", fill="both", expand=True)
+            if args.serial_log:
+                self._serial_toggle()
             self._msg_item = self.canvas.create_text(180, 240, fill="#888888", text="", font=("", 11),
                                                      justify="center")
 
@@ -603,6 +720,75 @@ def _gui_main(args, run=True):
                                  ("plus", "volup"), ("KP_Subtract", "voldown"), ("KP_Add", "volup")):
                 self.bind("<KeyPress-%s>" % keysym, lambda e, n=name: self._key(n, True))
                 self.bind("<KeyRelease-%s>" % keysym, lambda e, n=name: self._key(n, False))
+
+        # -- serial log pane ---------------------------------------------------
+        def _build_serial(self, frame):
+            bar = ttk.Frame(frame)
+            bar.pack(fill="x", side="top")
+            ttk.Label(bar, text="Serial log").pack(side="left")
+            ttk.Button(bar, text="Save…", width=6, command=self._serial_save).pack(side="right")
+            ttk.Button(bar, text="Clear", width=6, command=self._serial_clear).pack(side="right", padx=(0, 4))
+            self._serial_follow = tk.BooleanVar(value=True)
+            ttk.Checkbutton(bar, text="Follow", variable=self._serial_follow).pack(side="right", padx=(0, 6))
+            inner = ttk.Frame(frame)
+            inner.pack(fill="both", expand=True, pady=(4, 0))
+            import tkinter.font as tkfont
+            self._serial_font = tkfont.nametofont("TkFixedFont").copy()
+            self._serial_font.configure(size=9)
+            self._serial_text = tk.Text(inner, width=56, height=10, wrap="none", state="disabled",
+                                        bg="#101010", fg="#d0d0d0", insertbackground="#d0d0d0",
+                                        font=self._serial_font, highlightthickness=0, takefocus=0, undo=False)
+            ys = ttk.Scrollbar(inner, orient="vertical", command=self._serial_text.yview)
+            xs = ttk.Scrollbar(inner, orient="horizontal", command=self._serial_text.xview)
+            self._serial_text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+            ys.pack(side="right", fill="y")
+            xs.pack(side="bottom", fill="x")
+            self._serial_text.pack(side="left", fill="both", expand=True)
+            # The panel's P / H / - / = keys are bound on the window; do not fire them (a power press!) while
+            # the log has the focus.  Ctrl combinations (copy, select all) still work.
+            nav = ("Up", "Down", "Left", "Right", "Prior", "Next", "Home", "End")
+            self._serial_text.bind("<Key>", lambda e: None if (e.state & 0x4 or e.keysym in nav) else "break")
+            self._serial_text.bind("<Button-1>", lambda e: self._serial_text.focus_set())
+
+        def _serial_toggle(self):
+            want = self._serial_var.get()
+            if want and not self._serial_visible:
+                self._serial_frame.pack(side="right", fill="both", padx=(6, 0), before=self.canvas)
+                self._serial_visible = True
+                if self._serial_tail is None and args.serial_log:
+                    self._serial_tail = SerialTail(args.serial_log, self._serial_q.put)
+                    self._serial_tail.start()
+            elif not want and self._serial_visible:
+                self._serial_frame.pack_forget()
+                self._serial_visible = False
+
+        def _serial_append(self, lines):
+            t = self._serial_text
+            t.configure(state="normal")
+            t.insert("end", "\n".join(lines) + "\n")
+            over = int(t.index("end-1c").split(".")[0]) - 1 - SERIAL_MAX_LINES
+            if over > 0:
+                t.delete("1.0", "%d.0" % (over + 1))
+            t.configure(state="disabled")
+            if self._serial_follow.get():
+                t.see("end")
+
+        def _serial_clear(self):
+            self._serial_text.configure(state="normal")
+            self._serial_text.delete("1.0", "end")
+            self._serial_text.configure(state="disabled")
+
+        def _serial_save(self):
+            path = filedialog.asksaveasfilename(parent=self, title="Save serial log", defaultextension=".log",
+                                                filetypes=[("Log", "*.log"), ("Text", "*.txt"), ("All", "*.*")])
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self._serial_text.get("1.0", "end-1c") + "\n")
+                self._set_status("Serial log saved to %s" % path)
+            except OSError as ex:
+                messagebox.showerror("Save serial log", str(ex), parent=self)
 
         # -- status / lifecycle ----------------------------------------------
         def _set_status(self, text):
@@ -671,6 +857,15 @@ def _gui_main(args, run=True):
                         self._set_status(text)
             except queue.Empty:
                 pass
+            lines, n = [], 0
+            try:
+                while n < 20:                                  # batches; keeps one pump tick short
+                    lines += self._serial_q.get_nowait()
+                    n += 1
+            except queue.Empty:
+                pass
+            if lines:
+                self._serial_append(lines)
             with self._frame_lock:
                 serial = self._frame_serial
             if serial != self._shown_serial:
@@ -706,7 +901,8 @@ def _gui_main(args, run=True):
             if self._first_frame:
                 self._first_frame = False
                 sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-                s0 = min(1.0, 0.85 * sh / rh, 0.85 * (sw - 140) / rw)
+                extra = self._serial_frame.winfo_reqwidth() + 6 if self._serial_visible else 0
+                s0 = min(1.0, 0.85 * sh / rh, 0.85 * (sw - 140 - extra) / rw)
                 if not have_pil:
                     z, sub = scale_to_ratio(s0)
                     s0 = z / sub
@@ -1197,6 +1393,8 @@ def _gui_main(args, run=True):
                     pass
             if self.grabber:
                 self.grabber.stop_ev.set()
+            if self._serial_tail:
+                self._serial_tail.stop_ev.set()
             self._phone_win = None
             self.qmp.close()
             self.destroy()
@@ -1375,6 +1573,53 @@ def selftest():
           == ["-M", "ipad1", "-audio", "driver=none", "-display", "none"])
     check("build_qemu_args: commas in the socket path are escaped",
           build_qemu_args([], "/tmp/a,b.sock")[-1] == "unix:/tmp/a,,b.sock,server,nowait")
+    check("build_qemu_args: serial_log spells mon:stdio out with a logfile",
+          build_qemu_args(["-M", "x", "-serial", "mon:stdio", "-audio", "driver=none"], None, False, "/tmp/s.log")
+          == ["-M", "x", "-chardev", "stdio,id=ltserial,mux=on,logfile=/tmp/s.log", "-serial", "chardev:ltserial",
+              "-mon", "chardev=ltserial,mode=readline", "-audio", "driver=none"])
+    check("build_qemu_args: serial_log leaves other -serial options alone",
+          build_qemu_args(["-serial", "file:/tmp/x"], None, False, "/tmp/s.log") == ["-serial", "file:/tmp/x"])
+    check("build_qemu_args: no serial_log, no serial edit",
+          build_qemu_args(["-serial", "mon:stdio"]) == ["-serial", "mon:stdio"])
+
+    # serial log cleaning: the doubled-newline problem
+    sc = SerialCleaner()
+    check("serial: \\r\\n, \\n\\r\\n and \\r\\r\\n are each one line break",
+          sc.feed(b"one\r\ntwo\n\r\nthree\r\r\nfour\n") == ["one", "two", "three", "four"])
+    sc = SerialCleaner()
+    got = sc.feed(b"abc\r") + sc.feed(b"\ndef\r\n") + sc.feed(b"\n\nghi")
+    check("serial: a break split across chunks does not make blank lines; the tail waits",
+          got == ["abc", "def"] and sc.flush() == ["ghi"] and sc.flush() == [], got)
+    sc = SerialCleaner()
+    check("serial: escape sequences and control characters are dropped",
+          sc.feed(b"\x1b[0m\x1b[1;32mok\x1b[0m\x07 done\x00\r\n") == ["ok done"])
+    sc = SerialCleaner()
+    got = sc.feed(b"caf\xc3") + sc.feed(b"\xa9 \xff\r\n")
+    check("serial: UTF-8 split across chunks and invalid bytes do not raise",
+          len(got) == 1 and got[0].startswith("café ") and "�" in got[0], got)
+
+    # serial tail: a file that appears late, appended in pieces
+    d2 = tempfile.mkdtemp(prefix="touchpanel-serial-")
+    try:
+        slog, seen = os.path.join(d2, "serial.log"), []
+        tail = SerialTail(slog, seen.extend)
+        tail.start()
+        time.sleep(0.3)
+        with open(slog, "ab") as f:
+            f.write(b"boot\r\n\r\nlogin: ")
+            f.flush()
+            time.sleep(0.2)
+            check("serial tail: complete lines arrive, the prompt waits", seen == ["boot"], seen)
+            time.sleep(SERIAL_PARTIAL_FLUSH_S + 0.4)
+            check("serial tail: an unfinished line is shown after a short idle", seen == ["boot", "login:"], seen)
+            f.write(b"root\n")
+            f.flush()
+        time.sleep(0.4)
+        check("serial tail: later appends are followed", seen == ["boot", "login:", "root"], seen)
+        tail.stop_ev.set()
+        tail.join(2)
+    finally:
+        shutil.rmtree(d2, ignore_errors=True)
 
     # QMP client + grabber against the fake
     d = tempfile.mkdtemp(prefix="touchpanel-selftest-")
@@ -1468,6 +1713,8 @@ def main(argv=None):
                     help="show the screen rotated clockwise (needs Pillow)")
     ap.add_argument("--scale", default="fit", help="'fit' (default) or a factor such as 1, 0.5")
     ap.add_argument("--connect-timeout", type=float, default=90.0, help="seconds to wait for QEMU's socket")
+    ap.add_argument("--serial-log", help="file QEMU appends the guest's serial output to (LT_SERIAL_LOG for "
+                                         "--exec-qemu); shown, cleaned up, in a pane beside the screen")
     ap.add_argument("--keep-open", action="store_true", help="do not close the window when QEMU exits")
     ap.add_argument("--selftest", action="store_true", help="run the headless self-test and exit")
     args = ap.parse_args(argv)

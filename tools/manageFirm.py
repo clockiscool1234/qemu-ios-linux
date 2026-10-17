@@ -10,7 +10,7 @@ directory and the prefix can be changed from the Settings button (saved to
      (progress bar; uses aria2c -x16 -s16 when installed) and the chosen bootrom
      copied into the device folder
   •  Optional "Jailbreak the device" checkbox on New Virtual Device (firmwarekit create
-     --jailbreak: afc2 + Cydia; iPhone OS 2.0+, not the iPod touch 2G; runs as root)
+     --jailbreak: afc2 + Cydia; iPhone OS 2.0+; runs as root)
   •  Start / stop QEMU for a device via its generated run.sh
   •  Delete device folders
   •  firmwarekit's scratch (work) directory is created inside the device folder
@@ -100,7 +100,7 @@ DEVICES: dict = {
         "product":       "iPod2,1",
         "qemu_machine":  "iPod-Touch",
         "soc":           "S5L8720",
-        "needs_sudo":    False,
+        "needs_sudo":    True,       # create loop-mounts the rootfs to build the NAND
         "needs_bootrom": True,
         "builds": {
             "5F138": "2.1.1",
@@ -1118,9 +1118,11 @@ def prepare_touch_panel(env: dict, qemu: str) -> Optional[dict]:
     run.sh ends in `exec ${QEMU:-qemu-system-arm} ... -display sdl,...`, so QEMU is
     pointed at a one-line wrapper that runs `touchPanel.py --exec-qemu`; that adds
     `-qmp unix:SOCK,server,nowait`, swaps the display for `-display none` and execs
-    the real binary (passed in LT_REAL_QEMU).  Updates `env` in place and returns
-    {"dir", "sock"} (the caller removes "dir" when QEMU exits), or None if the
-    panel script is missing.
+    the real binary (passed in LT_REAL_QEMU).  The wrapper also turns run.sh's
+    `-serial mon:stdio` into a chardev that logs to LT_SERIAL_LOG, which the panel
+    shows in its serial pane.  Updates `env` in place and returns
+    {"dir", "sock", "serial"} (the caller removes "dir" when QEMU exits), or None if
+    the panel script is missing.
     """
     if not TOUCH_PANEL.is_file():
         return None
@@ -1130,17 +1132,22 @@ def prepare_touch_panel(env: dict, qemu: str) -> Optional[dict]:
         shlex.quote(sys.executable), shlex.quote(str(TOUCH_PANEL))))
     wrapper.chmod(0o755)
     sock = str(Path(tmp) / "qmp.sock")
+    serial = str(Path(tmp) / "serial.log")
     env["LT_REAL_QEMU"]    = qemu
     env["LT_QMP_SOCK"]     = sock
+    env["LT_SERIAL_LOG"]   = serial
     env["LT_HIDE_DISPLAY"] = "1"
     env["QEMU"]            = str(wrapper)
-    return {"dir": tmp, "sock": sock}
+    return {"dir": tmp, "sock": sock, "serial": serial}
 
 
 def spawn_touch_panel(sock: str, title: str, scale: str = "fit",
-                      rotate: int = 0) -> subprocess.Popen:
-    """Open the touch panel window for the QEMU listening on QMP socket `sock`."""
+                      rotate: int = 0, serial: str = "") -> subprocess.Popen:
+    """Open the touch panel window for the QEMU listening on QMP socket `sock`.
+    `serial` is the file QEMU logs the guest's serial output to (shown in the panel's side pane)."""
     cmd = [sys.executable, str(TOUCH_PANEL), "--qmp", sock, "--title", title]
+    if serial:
+        cmd += ["--serial-log", serial]
     if scale and scale != "fit":
         cmd += ["--scale", str(scale)]
     if rotate:
@@ -1219,6 +1226,162 @@ class ScrollableFrame(ttk.Frame):
         self._canvas.yview_scroll(step * 2, "units")
 
 
+class CreateProgressWindow(tk.Toplevel):
+    """Shown while a device is being created (the New Virtual Device dialog is hidden meanwhile):
+    the current stage, a percentage bar on the left, firmwarekit's log on the right."""
+
+    MAX_LOG_LINES = 6000
+
+    def __init__(self, parent, title: str, on_cancel: Callable, on_back: Callable,
+                 on_close: Callable) -> None:
+        super().__init__(parent)
+        self.title("Creating {}".format(title))
+        self.geometry("920x460")
+        self.minsize(640, 320)
+        try:
+            self.transient(parent)
+        except tk.TclError:
+            pass
+        self._on_cancel, self._on_back, self._on_close = on_cancel, on_back, on_close
+        self._pct = 0.0
+        self._done = False
+        self.protocol("WM_DELETE_WINDOW", self._x_pressed)
+
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(self, padding=12)
+        left.grid(row=0, column=0, sticky="ns")
+        ttk.Label(left, text="Stage", foreground="gray").pack(anchor="w")
+        self._stage_var = tk.StringVar(value="Starting\u2026")
+        ttk.Label(left, textvariable=self._stage_var, wraplength=250, justify="left",
+                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(2, 14))
+        self._pbar = ttk.Progressbar(left, mode="determinate", maximum=100, length=250)
+        self._pbar.pack(fill="x")
+        self._pct_var = tk.StringVar(value="0%")
+        ttk.Label(left, textvariable=self._pct_var).pack(anchor="e", pady=(2, 0))
+        self._detail_var = tk.StringVar(value="")
+        ttk.Label(left, textvariable=self._detail_var, foreground="gray",
+                  wraplength=250, justify="left").pack(anchor="w", pady=(10, 0))
+        self._btns = ttk.Frame(left)
+        self._btns.pack(side="bottom", anchor="w", pady=(16, 0))
+        self._cancel_btn = ttk.Button(self._btns, text="Cancel", command=self._cancel)
+        self._cancel_btn.pack(side="left")
+        self._back_btn = ttk.Button(self._btns, text="Back", command=self._back)
+        self._close_btn = ttk.Button(self._btns, text="Close", command=self._close)
+
+        right = ttk.Frame(self, padding=(0, 12, 12, 12))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        ttk.Label(right, text="Log", foreground="gray").grid(row=0, column=0, sticky="w")
+        self._text = tk.Text(right, wrap="none", state="disabled", height=10,
+                             font="TkFixedFont", background="#101010", foreground="#d8d8d8")
+        ysb = ttk.Scrollbar(right, orient="vertical", command=self._text.yview)
+        xsb = ttk.Scrollbar(right, orient="horizontal", command=self._text.xview)
+        self._text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self._text.grid(row=1, column=0, sticky="nsew")
+        ysb.grid(row=1, column=1, sticky="ns")
+        xsb.grid(row=2, column=0, sticky="ew")
+
+    # thread-safe entry points (the create flow runs in a worker thread)
+    def _ui(self, fn: Callable) -> None:
+        def _run():
+            try:
+                if self.winfo_exists():
+                    fn()
+            except tk.TclError:
+                pass
+        try:
+            self.after(0, _run)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def set_stage(self, label: str, pct: Optional[float] = None, detail: str = "") -> None:
+        """Stage text; pct only moves the bar forward (stages are reported in the order they happen)."""
+        def _do():
+            self._stage_var.set(label)
+            self._detail_var.set(detail)
+            if pct is not None:
+                self._set_pct(max(self._pct, pct))
+        self._ui(_do)
+
+    def set_status(self, msg: str, busy: bool = False, pct: Optional[float] = None) -> None:
+        """A download / generic status: pct sets the bar exactly, busy spins it."""
+        def _do():
+            self._stage_var.set(msg)
+            self._pbar.stop()
+            if pct is not None:
+                self._pct = pct
+                self._set_pct(pct, force=True)
+            elif busy:
+                self._pbar.configure(mode="indeterminate")
+                self._pbar.start(10)
+                self._pct_var.set("\u2026")
+        self._ui(_do)
+
+    def _set_pct(self, pct: float, force: bool = False) -> None:
+        pct = max(0.0, min(100.0, pct))
+        if not force and str(self._pbar.cget("mode")) != "determinate":
+            self._pbar.stop()
+        self._pbar.configure(mode="determinate", maximum=100)
+        self._pbar["value"] = pct
+        self._pct = pct
+        self._pct_var.set("{:.0f}%".format(pct))
+
+    def reset_progress(self) -> None:
+        """A new phase starts (the download ends, firmwarekit begins): the bar starts over."""
+        def _do():
+            self._pbar.stop()
+            self._set_pct(0.0, force=True)
+            self._pct = 0.0
+        self._ui(_do)
+
+    def append_log(self, line: str) -> None:
+        def _do():
+            t = self._text
+            at_end = t.yview()[1] >= 0.999
+            t.configure(state="normal")
+            t.insert("end", line + "\n")
+            n = int(t.index("end-1c").split(".")[0])
+            if n > self.MAX_LOG_LINES:
+                t.delete("1.0", "{}.0".format(n - self.MAX_LOG_LINES + 1000))
+            t.configure(state="disabled")
+            if at_end:
+                t.see("end")
+        self._ui(_do)
+
+    def finish(self, ok: bool, msg: str) -> None:
+        def _do():
+            self._done = True
+            self._pbar.stop()
+            if ok:
+                self._set_pct(100.0, force=True)
+            else:
+                self._pbar.configure(mode="determinate")
+            self._stage_var.set(msg)
+            self._cancel_btn.pack_forget()
+            if ok:
+                self._back_btn.pack_forget()
+            else:
+                self._back_btn.pack(side="left", padx=(0, 6))
+            self._close_btn.pack(side="left")
+        self._ui(_do)
+
+    # buttons
+    def _cancel(self) -> None:
+        self._on_cancel()
+
+    def _back(self) -> None:
+        self._on_back()
+
+    def _close(self) -> None:
+        self._on_close()
+
+    def _x_pressed(self) -> None:
+        (self._close if self._done else self._cancel)()
+
+
 class CreateDeviceDialog(tk.Toplevel):
     """Wizard dialog that wraps firmwarekit.py to create a device bundle."""
 
@@ -1240,7 +1403,11 @@ class CreateDeviceDialog(tk.Toplevel):
         self._base    = base_dir
         self._prefix  = prefix
         self._catalog = catalog
-        self._log     = log_fn
+        self._main_log = log_fn
+        self._log     = self._tee_log     # the main window's log, and the progress window's
+        self._prog: Optional["CreateProgressWindow"] = None
+        self._stage_pct = 0.0
+        self._gen = 0                     # bumped when a running create is aborted
         self._downloads = Path(download_dir) if download_dir else default_download_dir()
         self._proc    = None
         self._dl_proc = None      # aria2c, while downloading
@@ -1453,8 +1620,6 @@ class CreateDeviceDialog(tk.Toplevel):
     @staticmethod
     def _jailbreak_problem(board: str, version: str) -> str:
         """Why this board/build can't be jailbroken by firmwarekit create ('' = it can)."""
-        if board == "n72ap":
-            return "Not available for this board: its create builds no root filesystem here."
         m = re.match(r"\d+", version or "")
         if m and int(m.group()) < 2:
             return "Needs iPhone OS 2.0 or later."
@@ -1570,6 +1735,89 @@ class CreateDeviceDialog(tk.Toplevel):
                 self._pbar.configure(mode="determinate", maximum=100)
                 self._pbar["value"] = 0
         self._ui(_do)
+        if self._prog is not None:
+            self._prog.set_status(msg, busy=busy, pct=pct)
+
+    def _tee_log(self, msg: str) -> None:
+        self._main_log(msg)
+        if self._prog is not None:
+            self._prog.append_log(msg)
+
+    # (pattern, stage label, overall % reached) for firmwarekit's own progress lines
+    _STAGES = [
+        (r"^IPSW ok|^skipping IPSW SHA-1", "Verifying the IPSW", 4),
+        (r"^building nor\.bin", "Building the NOR image", 10),
+        (r"^decrypting firmware components", "Decrypting firmware components", 22),
+        (r"^building kboot\.bin", "Building the kernel boot image", 26),
+        (r"^bootrom ", "Installing the bootrom", 30),
+        (r"^\[nand 1/5\]", "NAND 1/5: decrypting the root filesystem", 34),
+        (r"^extracting HFS\+ volume|^\[nand 2/5\]", "Extracting the root filesystem", 44),
+        (r"^\[nand 3/5\]", "NAND 3/5: growing the volume", 52),
+        (r"^\[nand 4/5\] fstab|mounting|^editing", "Editing the system volume", 58),
+        (r"activating lockdownd", "Activating lockdownd", 66),
+        (r"installing the jailbreak", "Installing the jailbreak", 72),
+        (r"seeding the guest package", "Seeding the guest package", 76),
+        (r"^\[nand 5/5\]|^writing the NAND page|^building NAND store",
+         "Writing the NAND page store (the longest step)", 82),
+        (r"^done:", "Finishing", 98),
+    ]
+
+    def _create_line(self, line: str) -> None:
+        """One line of firmwarekit output: into the logs, and the stage / percentage if it names one."""
+        self._log(line)
+        for pat, label, pct in self._STAGES:
+            if re.search(pat, line):
+                self._stage_pct = max(self._stage_pct, pct)
+                if self._prog is not None:
+                    self._prog.set_stage(label, self._stage_pct)
+                break
+
+    # ── hide the form, show the progress window ──────────────────────────────
+
+    def _open_progress(self, board: str) -> None:
+        self._stage_pct = 0.0
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.withdraw()
+        self._prog = CreateProgressWindow(
+            self.master, DEVICES[board]["name"],
+            on_cancel=self._progress_cancel, on_back=self._progress_back,
+            on_close=self._progress_close)
+        self._prog.set_stage("Starting\u2026", 0)
+
+    def _progress_cancel(self) -> None:
+        """Cancel pressed while running: abort (after confirming), and put the form back."""
+        if not self._abort_running(self._prog or self):
+            return
+        self._progress_back()
+
+    def _progress_back(self) -> None:
+        """Back to the form, e.g. to fix something after a failure."""
+        prog, self._prog = self._prog, None
+        if prog is not None:
+            prog.destroy()
+        self._create_btn.configure(state="normal")
+        self.deiconify()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _progress_close(self) -> None:
+        """Close the progress window and the form with it."""
+        prog, self._prog = self._prog, None
+        if prog is not None:
+            prog.destroy()
+        self.destroy()
+
+    def _fail(self, msg: str) -> None:
+        """The create stopped with an error: say so on the form and in the progress window."""
+        self._set_status(msg)
+        if self._prog is not None:
+            self._prog.finish(False, msg)
+        self._ui(lambda: self._create_btn.configure(state="normal"))
 
     # ── create flow ──────────────────────────────────────────────────────────
 
@@ -1623,12 +1871,14 @@ class CreateDeviceDialog(tk.Toplevel):
                                        "Select a valid IPSW file.", parent=self)
                 self._create_btn.configure(state="normal")
                 return
+            self._open_progress(board)
             threading.Thread(
                 target=self._run_create,
                 args=(board, dev, build, ipsw, out, cat),
                 daemon=True,
             ).start()
         else:
+            self._open_progress(board)
             threading.Thread(
                 target=self._download_and_create,
                 args=(board, dev, build, out, cat),
@@ -1638,6 +1888,7 @@ class CreateDeviceDialog(tk.Toplevel):
     def _download_and_create(
         self, board: str, dev: dict, build: str, out: str, cat: str
     ) -> None:
+        gen = self._gen
         product = dev["product"]
         version = dev["builds"][build]
         self._set_status(
@@ -1651,9 +1902,7 @@ class CreateDeviceDialog(tk.Toplevel):
             try:
                 dl_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                self._set_status("Cannot create download folder {}: {}".format(
-                    dl_dir, exc))
-                self._ui(lambda: self._create_btn.configure(state="normal"))
+                self._fail("Cannot create download folder {}: {}".format(dl_dir, exc))
                 return
             # Catalog sources first (they cover beta seeds and RAR-packed builds, with
             # mirrors); ipsw.me last, for final releases only.
@@ -1664,9 +1913,7 @@ class CreateDeviceDialog(tk.Toplevel):
                     cands.append({"url": api, "kind": "ipsw",
                                   "member": None, "sha1": None})
             if not cands:
-                self._set_status(
-                    "No download source for this build.  Try browsing for the file.")
-                self._ui(lambda: self._create_btn.configure(state="normal"))
+                self._fail("No download source for this build.  Try browsing for the file.")
                 return
 
             def _set_dl_proc(p) -> None:
@@ -1703,7 +1950,7 @@ class CreateDeviceDialog(tk.Toplevel):
                 self._set_status("Downloading {}…  0%".format(label), pct=0)
                 try:
                     download_url_to_file(cand["url"], target, _progress,
-                                         should_stop=lambda: self._closed,
+                                         should_stop=lambda: self._closed or gen != self._gen,
                                          on_proc=_set_dl_proc)
                     if is_rar:
                         self._set_status("Unpacking {}…".format(cand["member"]),
@@ -1728,9 +1975,7 @@ class CreateDeviceDialog(tk.Toplevel):
                 if ok:
                     break
             if not ok:
-                self._set_status("Download failed (see the log).  "
-                                 "Try browsing for the file.")
-                self._ui(lambda: self._create_btn.configure(state="normal"))
+                self._fail("Download failed (see the log).  Try browsing for the file.")
                 return
 
         self._set_status("Download complete. Running firmwarekit.py…", busy=True)
@@ -1738,14 +1983,12 @@ class CreateDeviceDialog(tk.Toplevel):
 
     @staticmethod
     def _as_root(cmd: list) -> list:
-        """Prefix cmd so it runs as root, via pkexec (sudo if pkexec is absent).
+        """Prefix cmd so it runs as root through pkexec (never sudo: a GUI has no terminal to answer it).
 
         pkexec starts the program in a sanitised environment and in root's
         home directory, so relative paths are made absolute and the variables
         firmwarekit needs are passed explicitly through env(1).
         """
-        if not shutil.which("pkexec"):
-            return ["sudo", "-E"] + cmd
         fwd = ["{}={}".format(k, os.environ[k])
                for k in ("BOOTROM", "QEMU", "IT_KEYBAG") if os.environ.get(k)]
         return ["pkexec", "env"] + fwd + cmd
@@ -1754,6 +1997,7 @@ class CreateDeviceDialog(tk.Toplevel):
         self, board: str, dev: dict, build: str,
         ipsw: str, out: str, cat: str
     ) -> None:
+        gen = self._gen
         ipsw, cat, out = (os.path.abspath(os.path.expanduser(x))
                           for x in (ipsw, cat, out))
         cmd = [
@@ -1781,6 +2025,9 @@ class CreateDeviceDialog(tk.Toplevel):
         if jailbreak:
             cmd += ["--jailbreak"]
         if dev.get("needs_sudo") or jailbreak or (gp and board != "n72ap"):      # the jailbreak edits the loop-mounted rootfs
+            if not shutil.which("pkexec"):
+                self._fail("This device needs root and pkexec (polkit) is not installed.")
+                return
             cmd = self._as_root(cmd)
 
         try:
@@ -1789,45 +2036,61 @@ class CreateDeviceDialog(tk.Toplevel):
             pass    # firmwarekit (as root) may still be able to create it
 
         self._set_status("Running firmwarekit.py…", busy=True)
+        if self._prog is not None:
+            self._prog.reset_progress()
+            self._prog.set_stage("Starting firmwarekit\u2026", 2)
+        self._stage_pct = 2.0
         self._log("$ " + " ".join(str(x) for x in cmd))
 
         try:
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             for line in self._proc.stdout:
-                self._log(line.rstrip())
+                self._create_line(line.rstrip())
             self._proc.wait()
             rc = self._proc.returncode
-            if rc == 0:
+            if gen != self._gen or self._closed:
+                pass                    # cancelled: the progress window is already gone
+            elif rc == 0:
                 self._set_status("Device created successfully!")
-                self._ui(self._close, 2500)
+                if self._prog is not None:
+                    self._prog.finish(True, "Device created successfully!")
+                self._ui(self.destroy)  # the form is done; the progress window stays until Close
             else:
-                self._set_status(
-                    "firmwarekit.py exited with code {}.".format(rc))
+                self._fail("firmwarekit.py exited with code {} (see the log).".format(rc))
         except Exception as exc:
-            self._set_status("Error: {}".format(exc))
+            self._fail("Error: {}".format(exc))
         finally:
             self._proc = None
             self._ui(lambda: self._create_btn.configure(state="normal"))
 
     # ── close ────────────────────────────────────────────────────────────────
 
-    def _close(self) -> None:
+    def _abort_running(self, parent) -> bool:
+        """Stop a running download / firmwarekit after confirming; False when the user declined."""
         dl = self._dl_proc
         if dl and dl.poll() is None:
             if not messagebox.askyesno(
                 "Download in progress",
-                "The IPSW is still downloading.  Cancel it?", parent=self):
-                return
-        self._closed = True            # stops the download thread
-        if dl and dl.poll() is None:
-            dl.terminate()
+                "The IPSW is still downloading.  Cancel it?", parent=parent):
+                return False
         if self._proc and self._proc.poll() is None:
             if not messagebox.askyesno(
                 "In progress",
-                "firmwarekit.py is still running.  Abort?", parent=self):
-                return
+                "firmwarekit.py is still running.  Abort?", parent=parent):
+                return False
             self._proc.terminate()
+        self._gen += 1                 # stops the download / create threads (they hold the old number)
+        if dl and dl.poll() is None:
+            dl.terminate()
+        return True
+
+    def _close(self) -> None:
+        if not self._abort_running(self):
+            return
+        if self._prog is not None:
+            self._prog.destroy()
+            self._prog = None
         self.destroy()
 
 
@@ -2555,7 +2818,8 @@ class App(tk.Tk):
         try:
             info["proc"] = spawn_touch_panel(
                 info["sock"], info["title"],
-                info.get("scale", "fit"), info.get("rotate", 0))
+                info.get("scale", "fit"), info.get("rotate", 0),
+                info.get("serial", ""))
         except Exception as exc:
             self.log("  touch panel failed to start: {}".format(exc))
             return

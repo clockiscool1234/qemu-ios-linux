@@ -41,11 +41,16 @@ def nand_epoch(version):
     return 1 if (m and int(m.group()) < 3) else 4
 
 
-def build(ipsw_path, entry, ri, out, work, log=print):
-    """Write <out>/nand.  Returns the number of page files written."""
+def build(ipsw_path, entry, ri, out, work, log=print, jailbreak_dir=None, activate=True):
+    """Write <out>/nand.  Returns the number of page files written.
+    jailbreak_dir: the fetched Cydia bootstrap directory (firmwarekit.jb_fetch); when given, afc2 + Cydia are
+    installed in the volume after the other edits.
+    activate: patch + re-sign lockdownd so the device reports Activated (the "Connect to iTunes" screen otherwise);
+    a patcher that rejects this lockdownd is a warning, not a failure."""
     import firmwarekit as fk                      # lazy: firmwarekit imports this module's caller
     import ipad1_fw
 
+    fk.require_root("building the n72ap NAND (loop-mounting the rootfs)")   # before any slow work
     nand_dir = os.path.join(out, "nand")
     if os.path.exists(nand_dir):
         raise fk.FirmwareError("%s already exists; refusing to overwrite a NAND image" % nand_dir)
@@ -101,6 +106,22 @@ def build(ipsw_path, entry, ri, out, work, log=print):
             shutil.rmtree(p, ignore_errors=True)
             if os.path.isfile(p):
                 os.unlink(p)
+        if activate:
+            log("[nand 4/5] activating lockdownd ...")
+            try:
+                rep = fk.activate_volume(m, log, image=img)
+                log("  lockdownd: %s -> %s" % (rep["input_sha256"][:12], rep["output_sha256"][:12]))
+            except fk.ActivationError as e:
+                log("warning: lockdownd was NOT activated (%s)" % e)
+                log("         the patcher rejected this lockdownd; the device will stop at \"Connect to iTunes\"")
+            except (fk.FirmwareError, OSError) as e:
+                log("warning: lockdownd was NOT activated (%s)" % e)
+        if jailbreak_dir:
+            log("[nand 4/5] installing the jailbreak (afc2, Cydia, Substrate) ...")
+            try:
+                fk.jailbreak_volume(m, jailbreak_dir, img, log)
+            except OSError as e:
+                raise fk.FirmwareError("the jailbreak edits failed (%s); the volume may be full" % e)
 
     fk.with_mounted(img, mnt, edit)
     try:

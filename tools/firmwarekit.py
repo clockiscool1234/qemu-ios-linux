@@ -1042,22 +1042,28 @@ def edit_volume(m, iboot, ipsw, kc_member, log=print, activate=True):
     return rep
 
 
+def require_root(what):
+    """Loop-mounting needs root.  sudo is never used from here (no terminal to ask on, so it hangs or fails
+    unpredictably): run firmwarekit as root, or start it through manageFirm, which uses pkexec."""
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise FirmwareError("%s needs root: run firmwarekit as root (e.g. `pkexec env PATH=$PATH python3 "
+                            "firmwarekit.py create ...`), or create the device from manageFirm.py, which asks "
+                            "for it through pkexec" % what)
+
+
 def with_mounted(volume, mnt, fn):
+    require_root("mounting the volume read-write")
     os.makedirs(mnt, exist_ok=True)
     r = subprocess.run(["mount", "-t", "hfsplus", "-o", "loop,rw,force", volume, mnt],
                        capture_output=True, text=True)
     if r.returncode:
-        r = subprocess.run(["sudo", "mount", "-t", "hfsplus", "-o", "loop,rw,force", volume, mnt],
-                           capture_output=True, text=True)
-    if r.returncode:
-        raise FirmwareError("mounting the volume read-write failed (need root and the Linux hfsplus "
+        raise FirmwareError("mounting the volume read-write failed (need the Linux hfsplus "
                             "module; a journaled volume mounts read-only): " + r.stderr.strip())
     try:
         return fn(mnt)
     finally:
         subprocess.run(["sync"])
         subprocess.run(["umount", mnt], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["sudo", "umount", mnt], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2850,8 +2856,7 @@ def run_keybag_provisioning(args, qemu_machine, dec_dir, ident_path,
         try:
             os.chown(target, 0, 0)
         except (PermissionError, AttributeError):
-            subprocess.run(["sudo", "chown", "0:0", target], check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pass        # not root: the helper stays owned by the user
     with_mounted(rd_out, mnt, _install_helper)
     try:
         os.rmdir(mnt)
