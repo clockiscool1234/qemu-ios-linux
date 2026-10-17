@@ -315,6 +315,8 @@ struct S5L8930D1815State {
     qemu_irq ap_power;      /* "ap-power" out: the AP's rails, 0 while it hibernates */
     bool ap_off;            /* hibernating: the AP is unpowered, DRAM in self-refresh */
     bool ap_waking;         /* the next reset is the AP's power-on; the PMU keeps everything */
+    bool poweroff_exits;    /* "poweroff-exits": a cable halt ends QEMU instead of entering
+                             * iBoot's power-off simulation */
 };
 
 /*
@@ -579,6 +581,22 @@ static int d1815_send(I2CSlave *i2c, uint8_t data)
         if (data == PMU_SYS_RESTART) {
             if (d1815_halt_reason(s)) {
                 qatomic_set(&d1815_shutdown_confirmed, 1);
+                /*
+                 * The OS halted with a cable attached (0x8F = 0x90): on
+                 * hardware the PMU restarts into iBoot's power-off
+                 * simulation and the device sits there, charging, so QEMU
+                 * never saw a shutdown (only the standby write, used when
+                 * no cable is attached, exited). The volumes are unmounted
+                 * by now, so end QEMU like the standby write does.
+                 * pmu-chargetrap (0x10) is a boot-time charge wait, not a
+                 * power-off, and keeps the restart. Set poweroff-exits=off
+                 * to get the simulation back (the power button then boots).
+                 */
+                if (s->poweroff_exits &&
+                    (s->regs[PMU_BOOT_REASON] & 0xd0) == 0x90) {
+                    qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+                    return 0;
+                }
             }
             s->restarting = true;
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
@@ -686,6 +704,7 @@ static const VMStateDescription vmstate_s5l8930_d1815 = {
 
 static const Property d1815_properties[] = {
     DEFINE_PROP_UINT64("rtc-epoch", S5L8930D1815State, rtc_epoch, 0),
+    DEFINE_PROP_BOOL("poweroff-exits", S5L8930D1815State, poweroff_exits, true),
 };
 
 static void d1815_class_init(ObjectClass *klass, const void *data)

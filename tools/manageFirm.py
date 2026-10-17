@@ -9,6 +9,8 @@ directory and the prefix can be changed from the Settings button (saved to
   •  Create devices using tools/firmwarekit.py, with optional IPSW auto-download
      (progress bar; uses aria2c -x16 -s16 when installed) and the chosen bootrom
      copied into the device folder
+  •  Optional "Jailbreak the device" checkbox on New Virtual Device (firmwarekit create
+     --jailbreak: afc2 + Cydia; iPhone OS 2.0+, not the iPod touch 2G; runs as root)
   •  Start / stop QEMU for a device via its generated run.sh
   •  Delete device folders
   •  firmwarekit's scratch (work) directory is created inside the device folder
@@ -1168,6 +1170,55 @@ def locate_qemu() -> Optional[str]:
 # Create-Device dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
+class ScrollableFrame(ttk.Frame):
+    """A frame whose content scrolls vertically when it is taller than ~70% of the screen.
+
+    Put the widgets in ``.body``.  The scrollbar only shows when needed, and the mouse wheel
+    scrolls while the pointer is anywhere in the dialog (the dialog's own bindings, not global
+    ones).  Keep buttons that must stay reachable outside it, packed with side="bottom".
+    """
+
+    def __init__(self, parent, padding=0) -> None:
+        super().__init__(parent)
+        bg = ttk.Style(parent).lookup("TFrame", "background") or self.winfo_toplevel().cget("bg")
+        self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, bg=bg)
+        self._vsb = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self.body = ttk.Frame(self._canvas, padding=padding)
+        self._win = self._canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self._scrolls = False
+        self.body.bind("<Configure>", self._on_body)
+        self._canvas.bind("<Configure>",
+                          lambda e: self._canvas.itemconfigure(self._win, width=e.width))
+        top = self.winfo_toplevel()
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            top.bind(ev, self._on_wheel, add="+")
+
+    def _on_body(self, _e=None) -> None:
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        want = self.body.winfo_reqheight()
+        cap = int(self.winfo_screenheight() * 0.7)
+        self._canvas.configure(width=self.body.winfo_reqwidth(), height=min(want, cap))
+        self._scrolls = want > cap
+        if self._scrolls:
+            self._vsb.pack(side="right", fill="y")
+        else:
+            self._vsb.pack_forget()
+            self._canvas.yview_moveto(0)
+
+    def _on_wheel(self, e) -> None:
+        if not self._scrolls or not str(e.widget).startswith(str(self)):
+            return
+        if getattr(e, "num", 0) == 4:
+            step = -1
+        elif getattr(e, "num", 0) == 5:
+            step = 1
+        else:
+            step = -1 if e.delta > 0 else 1
+        self._canvas.yview_scroll(step * 2, "units")
+
+
 class CreateDeviceDialog(tk.Toplevel):
     """Wizard dialog that wraps firmwarekit.py to create a device bundle."""
 
@@ -1182,7 +1233,7 @@ class CreateDeviceDialog(tk.Toplevel):
     ) -> None:
         super().__init__(parent)
         self.title("New Virtual Device")
-        self.resizable(False, False)
+        self.resizable(False, True)
         self.grab_set()
         self.transient(parent)
 
@@ -1207,8 +1258,12 @@ class CreateDeviceDialog(tk.Toplevel):
 
     def _build_widgets(self) -> None:
         P = {"padx": 8, "pady": 4, "sticky": "w"}
-        f = ttk.Frame(self, padding=8)
-        f.pack(fill="both", expand=True)
+        # status, progress bar and buttons stay at the bottom; the form above them scrolls
+        fixed = ttk.Frame(self, padding=(8, 0, 8, 8))
+        fixed.pack(side="bottom", fill="x")
+        sf = ScrollableFrame(self, padding=8)
+        sf.pack(side="top", fill="both", expand=True)
+        f = sf.body
         row = 0
 
         # Device type
@@ -1308,19 +1363,28 @@ class CreateDeviceDialog(tk.Toplevel):
             row=row, column=1, columnspan=2, **P)
         row += 1
 
-        # Status label + progress bar
-        self._status_var = tk.StringVar(value="Ready.")
-        ttk.Label(f, textvariable=self._status_var,
-                  foreground="gray").grid(row=row, column=0, columnspan=3, **P)
+        # Jailbreak
+        self._jailbreak = tk.BooleanVar(value=False)
+        self._jb_cb = ttk.Checkbutton(
+            f, text="Jailbreak the device (afc2 + Cydia)", variable=self._jailbreak)
+        self._jb_cb.grid(row=row, column=1, columnspan=2, **P)
         row += 1
-        self._pbar = ttk.Progressbar(f, mode="indeterminate", length=500)
-        self._pbar.grid(row=row, column=0, columnspan=3, padx=8, pady=4,
-                        sticky="ew")
+        self._jb_hint = ttk.Label(f, text="", foreground="gray",
+                                  wraplength=420, justify="left")
+        self._jb_hint.grid(row=row, column=1, columnspan=2, **P)
         row += 1
 
+        # Status label + progress bar
+        self._status_var = tk.StringVar(value="Ready.")
+        ttk.Label(fixed, textvariable=self._status_var,
+                  foreground="gray").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        self._pbar = ttk.Progressbar(fixed, mode="indeterminate", length=500)
+        self._pbar.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
+        fixed.columnconfigure(0, weight=1)
+
         # Action buttons
-        bf = ttk.Frame(f)
-        bf.grid(row=row, column=0, columnspan=3, pady=8)
+        bf = ttk.Frame(fixed)
+        bf.grid(row=2, column=0, pady=8)
         self._create_btn = ttk.Button(bf, text="Create Device",
                                        command=self._on_create)
         self._create_btn.pack(side="left", padx=6)
@@ -1365,6 +1429,29 @@ class CreateDeviceDialog(tk.Toplevel):
         if info.get("status_note"):
             text += ("\n" if text else "") + info["status_note"]
         self._build_hint.configure(text=text)
+        if hasattr(self, "_jb_cb"):
+            self._refresh_jailbreak()
+
+    @staticmethod
+    def _jailbreak_problem(board: str, version: str) -> str:
+        """Why this board/build can't be jailbroken by firmwarekit create ('' = it can)."""
+        if board == "n72ap":
+            return "Not available for this board: its create builds no root filesystem here."
+        m = re.match(r"\d+", version or "")
+        if m and int(m.group()) < 2:
+            return "Needs iPhone OS 2.0 or later."
+        return ""
+
+    def _refresh_jailbreak(self) -> None:
+        board, build = self._cur_board(), self._cur_build()
+        version = DEVICES[board]["builds"].get(build, "") if build else ""
+        why = self._jailbreak_problem(board, version)
+        if why:
+            self._jailbreak.set(False)
+        self._jb_cb.configure(state="disabled" if why else "normal")
+        self._jb_hint.configure(
+            text=why or "Installs afc2 and Cydia (with Substrate on iOS 3-6). Needs root; "
+                        "downloads the Cydia bootstrap once; the first boot takes longer.")
 
     def _reload_catalog(self) -> None:
         cat = self._cat_var.get().strip()
@@ -1501,6 +1588,7 @@ class CreateDeviceDialog(tk.Toplevel):
             return
 
         self._create_btn.configure(state="disabled")
+        self._jb_requested = bool(self._jailbreak.get())    # read here: Tk vars belong to this thread
 
         if self._ipsw_mode.get() == "browse":
             ipsw = self._ipsw_var.get().strip()
@@ -1658,7 +1746,10 @@ class CreateDeviceDialog(tk.Toplevel):
         if bootrom and dev.get("needs_bootrom"):
             # firmwarekit copies it into the device folder; run.sh uses that copy
             cmd += ["--bootrom", os.path.abspath(os.path.expanduser(bootrom))]
-        if dev.get("needs_sudo"):
+        jailbreak = bool(getattr(self, "_jb_requested", False))
+        if jailbreak:
+            cmd += ["--jailbreak"]
+        if dev.get("needs_sudo") or jailbreak:      # the jailbreak edits the loop-mounted rootfs
             cmd = self._as_root(cmd)
 
         try:
@@ -1833,15 +1924,19 @@ class DevicePrefsDialog(tk.Toplevel):
                  boot_args_ok: bool, on_save: Callable) -> None:
         super().__init__(parent)
         self.title("Device Preferences")
-        self.resizable(False, False)
+        self.resizable(False, True)
         self.transient(parent)
         self.grab_set()
         self._on_save = on_save
 
         dev = DEVICES.get(board, {})
         P = {"padx": 8, "pady": 4, "sticky": "w"}
-        f = ttk.Frame(self, padding=10)
-        f.pack(fill="both", expand=True)
+        # Save / Reset / Cancel stay at the bottom; the preferences above them scroll
+        bf = ttk.Frame(self, padding=(10, 0, 10, 8))
+        bf.pack(side="bottom")
+        sf = ScrollableFrame(self, padding=10)
+        sf.pack(side="top", fill="both", expand=True)
+        f = sf.body
         row = 0
 
         ttk.Label(f, text=title, font=("", 10, "bold")).grid(
@@ -1985,8 +2080,6 @@ class DevicePrefsDialog(tk.Toplevel):
             row=row, column=1, columnspan=2, **P)
         row += 1
 
-        bf = ttk.Frame(f)
-        bf.grid(row=row, column=0, columnspan=3, pady=8)
         ttk.Button(bf, text="Save", command=self._save).pack(side="left", padx=6)
         ttk.Button(bf, text="Reset", command=self._reset).pack(side="left", padx=6)
         ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left", padx=6)

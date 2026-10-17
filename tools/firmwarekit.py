@@ -43,6 +43,7 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -1890,6 +1891,353 @@ def activate_volume(m, log=print, image=None):
 
 
 # ---------------------------------------------------------------------------------------------
+# Jailbreak option (port of FirmwareKit's SystemEdits.installJailbreak, installAFC2, installCydia, Cydia)
+# ---------------------------------------------------------------------------------------------
+#
+# `create --jailbreak` leaves on the device what a jailbreak of the time left: afc2 (lockdown's AFC served at "/"
+# as root) and Cydia with Substrate, from saurik's freeze.tar as Legacy iOS Kit ships it (pinned by commit and
+# SHA-1).  Cydia's Startup job finishes the install on the first boot (dpkg of the AutoInstall packages, uicache),
+# so the first boot of a jailbroken device takes longer.  The K48 family (and, harmlessly, the other kboot boards)
+# boots with amfi_get_out_of_my_way=1: with AMFI asking amfid about every ad hoc signed library, Substrate's launcher
+# makes amfid wait on itself and the boot stops before SpringBoard.
+#
+# Scope: iPhone OS 2.0 and later, on the boards whose rootfs create mounts (m68ap, n45ap, n18ap, n88ap, k48ap, n81ap,
+# n90ap).  Substrate comes for 3.x to 6.x, Cydia HTTPatch for 3.x (as in Swift).  Not ported: the iPod touch 2G's
+# it_typein-by-Substrate move (n72ap's create is a stub here, with no rootfs), and `firmwarekit edit --action
+# jailbreak` on an existing device.
+
+JB_SOURCE = ("https://raw.githubusercontent.com/LukeZGD/Legacy-iOS-Kit/"
+             "4b0a582f4d53e105be373b495734c8ed639fd634/resources/jailbreak/")
+JB_FILES = (
+    ("freeze.tar.gz", "c943e5ece72b7b71da589c22663a8f9b3b3d1190"),      # Cydia 1.1.30, apt, dpkg, bash, ...
+    ("cydiasubstrate.tar", "264f47938acc09e6cc2890a3cc7c7988a6822da3"),   # MobileSubstrate (3.x-6.x)
+    ("cydiahttpatch.tar", "3a1302c6294fe290c6d52186dd4fe56cda7fd661"),    # Cydia over http (3.x)
+)
+JB_SUBSTRATE_MAJORS = range(3, 7)
+JB_HTTPATCH_MAJOR = 3
+JB_BOOT_ARG = "amfi_get_out_of_my_way=1"
+JB_NO_STASH = ".cydia_no_stash"
+JB_METADATA = "private/var/lib/cydia/metadata.plist"
+JB_EXCLUDED = "private/var/Keychains"       # the bootstrap's trust store: iOS's own stays
+JB_SB_PREFS = "private/var/mobile/Library/Preferences/com.apple.springboard.plist"
+# Cydia's default third-party sources as reachable today (keyed as CydiaAddSource keys them).
+JB_SOURCES = ("http://apt.thebigboss.org/repofiles/cydia/", "http://modmyi.saurik.com/",
+              "http://zodttd.saurik.com/repo/cydia/")
+# Patcyh (a Substrate extension for lsd and installd, iOS 8.3+) comes out, as Legacy iOS Kit takes it out below 8.3.
+JB_PATCYH = (
+    "Library/MobileSubstrate/DynamicLibraries/patcyh.dylib",
+    "Library/MobileSubstrate/DynamicLibraries/patcyh.plist", "usr/lib/libpatcyh.dylib",
+    "private/var/lib/dpkg/info/com.saurik.patcyh.list", "private/var/lib/dpkg/info/com.saurik.patcyh.postrm",
+    "private/var/lib/dpkg/info/com.saurik.patcyh.extrainst_",
+)
+LOCKDOWN_SERVICES = "System/Library/Lockdown/Services.plist"
+AFCD, AFC2D = "usr/libexec/afcd", "usr/libexec/afc2d"
+SYSTEM_VERSION = "System/Library/CoreServices/SystemVersion.plist"
+MOBILE_UID = 501
+
+
+def jb_boot_args(boot_args):
+    """The boot-args of a jailbroken device."""
+    return boot_args if JB_BOOT_ARG in boot_args.split() else boot_args + " " + JB_BOOT_ARG
+
+
+def jb_default_cache():
+    """Where the bootstrap is kept between runs: the invoking user's ~/.cache/firmwarekit/Jailbreak."""
+    base = os.environ.get("XDG_CACHE_HOME")
+    who = invoking_user()
+    if who:
+        import pwd
+        try:
+            base = os.path.join(pwd.getpwuid(who[0]).pw_dir, ".cache")
+        except KeyError:
+            pass
+    return os.path.join(base or os.path.expanduser("~/.cache"), "firmwarekit", "Jailbreak")
+
+
+def jb_fetch(directory, log=print, download=None):
+    """The bootstrap packages in `directory`, each downloaded first when missing or other bytes (SHA-1 pinned).
+    -> the directory."""
+    import urllib.request
+
+    def fetch(url, dst):
+        req = urllib.request.Request(url, headers={"User-Agent": "firmwarekit"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(dst, "wb") as f:
+            shutil.copyfileobj(r, f)
+    download = download or fetch
+    os.makedirs(directory, exist_ok=True)
+    for name, sha1 in JB_FILES:
+        dst = os.path.join(directory, name)
+        if os.path.isfile(dst) and sha1_file(dst) == sha1:
+            continue
+        part = os.path.join(directory, "." + name + ".download")
+        log("Cydia: " + JB_SOURCE + name)
+        try:
+            download(JB_SOURCE + name, part)
+            got = sha1_file(part)
+            if got != sha1:
+                raise FirmwareError("Cydia: %s SHA-1 is %s, not %s" % (name, got, sha1))
+            os.replace(part, dst)
+        except OSError as e:
+            raise FirmwareError("Cydia: could not download %s (%s); fetch it by hand into %s" % (name, e, directory))
+        finally:
+            if os.path.exists(part):
+                os.remove(part)
+    who = invoking_user()
+    if who:     # downloaded as root: the cache stays the user's
+        for name in [""] + [n for n, _ in JB_FILES]:
+            try:
+                os.chown(os.path.join(directory, name) if name else directory, who[0], who[1])
+            except OSError:
+                pass
+    return directory
+
+
+def jb_entry_path(name):
+    """A tar member name as a volume path: no leading ./, no trailing /."""
+    return (name[2:] if name.startswith("./") else name).strip("/")
+
+
+def jb_members(package):
+    """[(volume path, permission bits, is a regular file)] of a bootstrap package, the excluded trust store out."""
+    import tarfile
+    out = []
+    with tarfile.open(package) as t:
+        for ti in t.getmembers():
+            path = jb_entry_path(ti.name)
+            if not path or path == JB_EXCLUDED or path.startswith(JB_EXCLUDED + "/"):
+                continue
+            out.append((path, ti.mode & 0o7777, ti.isreg()))
+    return out
+
+
+def jb_packages(directory, major):
+    """The packages to extract for iOS `major`: the bootstrap, Substrate on 3.x-6.x, Cydia HTTPatch on 3.x."""
+    names = [JB_FILES[0][0]]
+    if major in JB_SUBSTRATE_MAJORS:
+        names.append(JB_FILES[1][0])
+    if major == JB_HTTPATCH_MAJOR:
+        names.append(JB_FILES[2][0])
+    return [os.path.join(directory, n) for n in names]
+
+
+def _replace_file(path, data, mode=None):
+    """Write `data` as a fresh plain file (a stock file may carry UF_COMPRESSED + com.apple.decmpfs, which
+    would keep serving the old bytes), keeping its mode and owner."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        st = None
+    if st is not None:
+        os.unlink(path)
+    _put(path, data, mode if mode is not None else (st.st_mode & 0o7777 if st else None))
+    if st is not None:
+        try:
+            os.chown(path, st.st_uid, st.st_gid)
+        except OSError:
+            pass
+
+
+def _macho_sig(thin):
+    """(offset, size) of a thin 32-bit little-endian Mach-O's LC_CODE_SIGNATURE, or None."""
+    if len(thin) < 28 or struct.unpack_from("<I", thin, 0)[0] != 0xFEEDFACE:
+        return None
+    ncmds = struct.unpack_from("<I", thin, 16)[0]
+    at = 28
+    for _ in range(ncmds):
+        if at + 8 > len(thin):
+            return None
+        cmd, size = struct.unpack_from("<II", thin, at)
+        if size < 8:
+            return None
+        if cmd == 0x1D and at + 16 <= len(thin):
+            return struct.unpack_from("<II", thin, at + 8)
+        at += size
+    return None
+
+
+def resign_macho(data):
+    """Activation.signed for any 32-bit ARM Mach-O (fat or thin): the code-directory page hashes rebuilt as an
+    ad hoc signature, entitlements kept; size and layout unchanged."""
+    slices = _fat_arm_slices(data)
+    spans = [(0, len(data))] if slices is None else [(off, size) for _sub, off, size in slices]
+    if not spans:
+        raise ActivationError("fat Mach-O has no 32-bit ARM slice")
+    out = bytearray(data)
+    for off, size in spans:
+        thin = bytes(data[off:off + size])
+        sig = _macho_sig(thin)
+        if sig is None:
+            raise ActivationError("no code signature to refresh")
+        out[off:off + size] = resign_lockdownd(thin, sig)
+    return bytes(out)
+
+
+def afc2_strings(afcd):
+    """7.1's afcd serving "/" as the XPC service com.apple.afc2: its root and service name replaced in place (each
+    by a string no longer, padded with NULs).  Unsigned; the caller signs."""
+    d = afcd
+    for frm, to in ((b"/private/var/mobile/Media", b"/"), (b"com.apple.afcd", b"com.apple.afc2")):
+        old = frm + b"\0"
+        if old not in d:
+            raise FirmwareError("afcd: no %s" % frm.decode())
+        d = d.replace(old, to + b"\0" + bytes(len(frm) - len(to)))
+    return d
+
+
+def _read_plist(m, rel, image=None):
+    data, _ = read_hfs_file(m, rel, image)
+    return plistlib.loads(data)
+
+
+def jb_install_afc2(m, image=None, log=print):
+    """afc2: a com.apple.afc2 lockdown service serving "/" as root.  Through 7.0 it is the stock afcd under old-style
+    lockdown at "/"; 7.1's afcd takes neither --lockdown nor -d, so afc2 there is a copy of it (afc2d) run by its own
+    launchd job without the stock job's user.  -> the log line."""
+    stock, _ = read_hfs_file(m, AFCD, image)
+    old_style = b"--lockdown" in stock
+    services = _read_plist(m, LOCKDOWN_SERVICES, image)
+    if "com.apple.afc" not in services:
+        raise FirmwareError("%s has no com.apple.afc service" % LOCKDOWN_SERVICES)
+    if old_style:
+        services["com.apple.afc2"] = {"AllowUnactivatedService": True, "Label": "com.apple.afc2",
+                                      "ProgramArguments": ["/usr/libexec/afcd", "--lockdown", "-d", "/"]}
+    else:
+        services["com.apple.afc2"] = {"AllowUnactivatedService": True, "Label": "com.apple.afc2",
+                                      "XPCServiceName": "com.apple.afc2"}
+    _replace_file(os.path.join(m, LOCKDOWN_SERVICES), plistlib.dumps(services, fmt=plistlib.FMT_XML))
+    if old_style:
+        return "afc2: com.apple.afc2 runs afcd at / (Lockdown/Services.plist)"
+    _put(os.path.join(m, AFC2D), resign_macho(afc2_strings(stock)), 0o755)
+    job_rel = DAEMONS + "/com.apple.afcd.plist"
+    job = _read_plist(m, job_rel, image)
+    if job.get("Label") != "com.apple.afcd":
+        raise FirmwareError("%s: not com.apple.afcd's job" % os.path.basename(job_rel))
+    job["Label"] = "com.apple.afc2"
+    job["MachServices"] = {"com.apple.afc2": True}
+    job["ProgramArguments"] = ["/" + AFC2D]
+    job.pop("UserName", None)
+    _put(os.path.join(m, DAEMONS, "com.apple.afc2.plist"), plistlib.dumps(job, fmt=plistlib.FMT_XML), 0o644)
+    return "afc2: com.apple.afc2 is afc2d, afcd at / as an XPC service (Lockdown/Services.plist)"
+
+
+def jb_drop_patcyh_packages(text):
+    """dpkg's status/available text without the com.saurik.patcyh paragraph."""
+    return "\n\n".join(p for p in text.split("\n\n") if not p.startswith("Package: com.saurik.patcyh\n"))
+
+
+def jb_install_cydia(m, directory, major, log=print):
+    """The bootstrap extracted into the mounted system volume `m`, keeping every file the firmware already has
+    (tar --skip-old-files); its set-user-ID files (cydo, su, login, passwd) get their archive modes back, what it
+    added under /private/var/mobile becomes mobile's.  -> the log line."""
+    def exists(rel):
+        return os.path.lexists(os.path.join(m, rel))
+
+    entries, special = [], []
+    packages = jb_packages(directory, major)
+    for p in packages:
+        for path, mode, is_reg in jb_members(p):
+            entries.append(path)
+            if is_reg and mode & 0o6000:
+                special.append((path, mode))
+    added = {e for e in entries if not exists(e)}
+    # tar gives an existing folder the archive's mode and owner; the firmware's stay.
+    folders = {}
+    for e in entries:
+        st = os.lstat(os.path.join(m, e)) if exists(e) else None
+        if st is not None and stat.S_ISDIR(st.st_mode):
+            folders[e] = (st.st_mode & 0o7777, st.st_uid, st.st_gid)
+    for p in packages:
+        r = subprocess.run(["tar", "-xf", p, "-C", m, "--skip-old-files", "--no-same-owner",
+                            "-p", "--exclude", "./" + JB_EXCLUDED, "--exclude", JB_EXCLUDED],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise FirmwareError("tar -x %s: %s" % (os.path.basename(p), r.stderr.strip() or r.returncode))
+    for rel, (mode, uid, gid) in folders.items():
+        try:
+            os.chmod(os.path.join(m, rel), mode)
+            os.chown(os.path.join(m, rel), uid, gid)
+        except OSError:
+            pass
+    if not exists("Applications/Cydia.app/Cydia"):
+        raise FirmwareError("Cydia bootstrap: no Applications/Cydia.app/Cydia after extracting")
+    for rel in JB_PATCYH:
+        try:
+            os.remove(os.path.join(m, rel))
+        except OSError:
+            pass
+    for rel in ("private/var/lib/dpkg/status", "private/var/lib/dpkg/available"):
+        path = os.path.join(m, rel)
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        _replace_file(path, jb_drop_patcyh_packages(text).encode())
+    entries = [e for e in entries if e not in JB_PATCYH]
+    # SpringBoard lists a system app outside its own set only with this key.
+    had_prefs = exists(JB_SB_PREFS)
+    seed_plist(os.path.join(m, JB_SB_PREFS), lambda d: d.__setitem__("SBShowNonDefaultSystemApps", True))
+    # Cydia's first launch would otherwise stash /Applications, /usr/share and the rest onto the data volume
+    # ("Preparing Filesystem", then exit) to free a stock-sized root; this root is grown, so no stash.
+    _put(os.path.join(m, JB_NO_STASH), b"", 0o644)
+    # Its sources: read once by Cydia (as mobile), which keeps them in its preferences and removes the file.
+    sources = {"deb:%s:stable" % uri: {"Type": "deb", "URI": uri, "Distribution": "stable", "Sections": ["main"]}
+               for uri in JB_SOURCES}
+    _put(os.path.join(m, JB_METADATA), plistlib.dumps({"Version": 1, "Sources": sources}, fmt=plistlib.FMT_XML), 0o644)
+    mobile = [e for e in entries if e.startswith("private/var/mobile/") and (e in added or os.path.islink(os.path.join(m, e)))]
+    if not had_prefs and JB_SB_PREFS not in mobile:
+        mobile.append(JB_SB_PREFS)
+    for rel in mobile:
+        try:
+            os.lchown(os.path.join(m, rel), MOBILE_UID, MOBILE_UID)
+        except OSError:
+            pass
+    for path, mode in special:      # tar was told not to keep owners; the modes it can't be trusted with are set here
+        if path in added and exists(path):
+            os.chmod(os.path.join(m, path), mode)
+    return "Cydia: %s, %d of %d entries added" % (", ".join(os.path.basename(p) for p in packages),
+                                                  len(added), len(entries))
+
+
+def jailbreak_volume(m, directory, image=None, log=print):
+    """SystemEdits.installJailbreak over the mounted writable system volume `m` (`image`: the raw volume behind it):
+    afc2, then Cydia with Substrate.  Run after the volume's other edits (edit_volume removes launch daemons the
+    bootstrap's Cydia.Startup job must outlive).  -> a report dict."""
+    ver = _read_plist(m, SYSTEM_VERSION, image).get("ProductVersion", "")
+    major = int(ver.split(".")[0]) if ver[:1].isdigit() else 0
+    if major < 2:
+        raise FirmwareError("the jailbreak needs iPhone OS 2.0 or later (this volume is %s)" % (ver or "unknown"))
+    rep = {"ios": ver}
+    rep["afc2"] = jb_install_afc2(m, image, log)
+    log(rep["afc2"])
+    rep["cydia"] = jb_install_cydia(m, directory, major, log)
+    log(rep["cydia"])
+    return rep
+
+
+def jailbreak_kboot_rootfs(system_img, system_mib, work, directory, log=print):
+    """The jailbreak edits inside the extracted rootfs image of a kboot board: the volume grown to the partition
+    size first (Cydia needs the room), then mounted and edited."""
+    try:
+        hfs_grow(system_img, system_mib << 20)
+    except FirmwareError as e:
+        if "already larger" not in str(e):
+            raise
+    mnt = os.path.join(work, "mnt_jb")
+    print("installing the jailbreak (afc2, Cydia, Substrate) in the rootfs...")
+    try:
+        return with_mounted(system_img, mnt, lambda m: jailbreak_volume(m, directory, system_img, log))
+    except OSError as e:
+        raise FirmwareError("the jailbreak edits failed (%s); the volume inside the image may be full" % e)
+    finally:
+        try:
+            os.rmdir(mnt)
+        except OSError:
+            pass
+
+
+
+# ---------------------------------------------------------------------------------------------
 # create
 # ---------------------------------------------------------------------------------------------
 
@@ -2063,9 +2411,12 @@ def create_img2(args, entry, ipsw, ri, out, work):
         rep = {}
     else:
         print("mounting and editing (needs root + hfsplus) ...")
-        rep = with_mounted(vol, os.path.join(work, "mnt"),
-                           lambda m: edit_volume(m, iboot, ipsw, ri["kernelcache"],
-                                                 activate=not args.skip_activation))
+        def edits(m):
+            r = edit_volume(m, iboot, ipsw, ri["kernelcache"], activate=not args.skip_activation)
+            if getattr(args, "jailbreak", False):      # after edit_volume: it removes launch daemons
+                r["jailbreak"] = jailbreak_volume(m, args.jb_dir, vol)
+            return r
+        rep = with_mounted(vol, os.path.join(work, "mnt"), edits)
         print("edits:", json.dumps(rep, indent=1))
         if subprocess.run(["which", "fsck.hfsplus"], capture_output=True).returncode == 0:
             r = subprocess.run(["fsck.hfsplus", "-fn", vol], capture_output=True, text=True)
@@ -2259,6 +2610,8 @@ def create_kboot(args, entry, ipsw, ri, out, work):
     print("building kboot.bin...")
     kboot_out = os.path.join(out, "kboot.bin")
     boot_args = ipad1_kboot.DEFAULT_BOOT_ARGS
+    if getattr(args, "jailbreak", False):
+        boot_args = jb_boot_args(boot_args)
     if board in ("n18ap", "n88ap"):
         s5l_b = "n18" if board == "n18ap" else "n88"
         s5l8920_kboot.main(s5l_b, dec_dir, kboot_out, boot_args=boot_args,
@@ -2280,6 +2633,10 @@ def create_kboot(args, entry, ipsw, ri, out, work):
               "data_ark.plist)" % entry.get("version"))
     elif board in _ACTIVATED_KBOOT and not getattr(args, "skip_activation", False):
         activate_kboot_rootfs(system_img, work)
+
+    # 4c. the jailbreak option (afc2, Cydia, Substrate), after the activation edit.  Needs root + hfsplus.
+    if getattr(args, "jailbreak", False):
+        jailbreak_kboot_rootfs(system_img, int(entry.get("recipe", {}).get("system_mib", 1024)), work, args.jb_dir)
 
     # 5. Build NAND store
     print("building NAND store...")
@@ -2673,6 +3030,15 @@ def create(args):
     out = os.path.abspath(args.out)
     if os.path.exists(out) and os.listdir(out):
         raise FirmwareError("%s exists and is not empty; refusing to overwrite" % out)
+    if getattr(args, "jailbreak", False):
+        if BOARD_META[board][4] == "img3":
+            raise FirmwareError("--jailbreak: %s's create here builds no rootfs (IMG3 stub); nothing to edit" % board)
+        if getattr(args, "no_volume_edit", False):
+            raise FirmwareError("--jailbreak edits the volume; it can't be combined with --no-volume-edit")
+        if int(ri["version"].split(".")[0] or 0) < 2:
+            raise FirmwareError("--jailbreak needs iPhone OS 2.0 or later (this IPSW is %s)" % ri["version"])
+        args.jb_dir = jb_fetch(os.path.abspath(os.path.expanduser(getattr(args, "jailbreak_cache", None)
+                                                                  or jb_default_cache())))
     os.makedirs(out, exist_ok=True)
     tmp_prefix = BOARD_META[board][1]
     work = args.work or tempfile.mkdtemp(prefix=tmp_prefix + "-", dir=args.tmpdir)
@@ -3360,6 +3726,85 @@ def selftest(_args):
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+    # jailbreak option: the pure helpers, then Cydia's install over a fake volume
+    check("jb_entry_path strips ./ and trailing /",
+          jb_entry_path("./usr/bin/") == "usr/bin" and jb_entry_path("Applications") == "Applications")
+    check("jb_boot_args appends once",
+          jb_boot_args("a=1") == "a=1 " + JB_BOOT_ARG and jb_boot_args(jb_boot_args("a=1")) == "a=1 " + JB_BOOT_ARG)
+    afcd = b"x\0/private/var/mobile/Media\0y\0com.apple.afcd\0z"
+    patched = afc2_strings(afcd)
+    check("afc2 strings: same length, root and service name replaced",
+          len(patched) == len(afcd) and b"/\0" + bytes(24) + b"y" in patched and b"com.apple.afc2\0z" in patched)
+    try:
+        afc2_strings(b"no strings here")
+        check("afc2 strings: a missing string is an error", False)
+    except FirmwareError:
+        check("afc2 strings: a missing string is an error", True)
+    check("dpkg status: the patcyh paragraph goes",
+          jb_drop_patcyh_packages("Package: a\nX: 1\n\nPackage: com.saurik.patcyh\nX: 2\n\nPackage: b\nX: 3\n")
+          == "Package: a\nX: 1\n\nPackage: b\nX: 3\n")
+    d = tempfile.mkdtemp(prefix="jbtest-")
+    try:
+        import io
+        import tarfile
+        pk = os.path.join(d, "pk")
+        vol = os.path.join(d, "vol")
+        os.makedirs(pk)
+        os.makedirs(os.path.join(vol, "Applications"))
+        with open(os.path.join(vol, "Applications", "keep"), "w") as f:
+            f.write("stock")
+
+        def member(t, name, data=b"", mode=0o644, typ=tarfile.REGTYPE, link=""):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data) if typ == tarfile.REGTYPE else 0
+            ti.mode, ti.type, ti.linkname = mode, typ, link
+            t.addfile(ti, io.BytesIO(data) if typ == tarfile.REGTYPE else None)
+        status = b"Package: com.saurik.patcyh\nX: 1\n\nPackage: bash\nX: 2\n"
+        with tarfile.open(os.path.join(pk, JB_FILES[0][0]), "w:gz") as t:
+            member(t, "./Applications/Cydia.app/Cydia", b"cydia", 0o755)
+            member(t, "./Applications/keep", b"bootstrap", 0o644)
+            member(t, "./usr/libexec/cydia/cydo", b"cydo", 0o6755)
+            member(t, "./private/var/Keychains/TrustStore.sqlite3", b"trust")
+            member(t, "./private/var/mobile/Library/x", b"x")
+            member(t, "./usr/lib/libpatcyh.dylib", b"p")
+            member(t, "./private/var/lib/dpkg/status", status)
+        for n in (JB_FILES[1][0], JB_FILES[2][0]):
+            with tarfile.open(os.path.join(pk, n), "w") as t:
+                member(t, "./Library/MobileSubstrate/MobileSubstrate.dylib", n.encode(), 0o755)
+        check("jb_packages: Substrate on 3.x-6.x, HTTPatch on 3.x only",
+              [os.path.basename(x) for x in jb_packages(pk, 3)] == [n for n, _ in JB_FILES]
+              and len(jb_packages(pk, 5)) == 2 and len(jb_packages(pk, 7)) == 1)
+        members = {m[0]: m for m in jb_members(os.path.join(pk, JB_FILES[0][0]))}
+        check("jb_members: trust store out, set-user-ID mode kept",
+              "private/var/Keychains/TrustStore.sqlite3" not in members
+              and members["usr/libexec/cydia/cydo"][1] == 0o6755)
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            line = jb_install_cydia(vol, pk, 4)
+        read = lambda rel: open(os.path.join(vol, rel), "rb").read()
+        check("cydia: extracted, stock files kept, trust store and patcyh left out",
+              read("Applications/Cydia.app/Cydia") == b"cydia" and read("Applications/keep") == b"stock"
+              and not os.path.exists(os.path.join(vol, "private/var/Keychains"))
+              and not os.path.exists(os.path.join(vol, "usr/lib/libpatcyh.dylib"))
+              and os.path.exists(os.path.join(vol, "Library/MobileSubstrate/MobileSubstrate.dylib")),
+              line)
+        check("cydia: cydo is set-user-ID, dpkg status without patcyh",
+              os.stat(os.path.join(vol, "usr/libexec/cydia/cydo")).st_mode & 0o7777 == 0o6755
+              and read("private/var/lib/dpkg/status") == b"Package: bash\nX: 2\n")
+        sb = plistlib.loads(read(JB_SB_PREFS))
+        meta = plistlib.loads(read(JB_METADATA))
+        check("cydia: SpringBoard shows it, no stash, sources seeded",
+              sb.get("SBShowNonDefaultSystemApps") is True and os.path.exists(os.path.join(vol, JB_NO_STASH))
+              and meta["Version"] == 1 and len(meta["Sources"]) == len(JB_SOURCES))
+        # the bootstrap is SHA-1 pinned: other bytes are an error
+        try:
+            jb_fetch(os.path.join(d, "dl"), log=lambda *_: None, download=lambda u, dst: open(dst, "wb").write(b"bad"))
+            check("jb_fetch: wrong bytes are rejected", False)
+        except FirmwareError as e:
+            check("jb_fetch: wrong bytes are rejected", "SHA-1" in str(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
     print("\nALL OK" if ok else "\nFAILURES")
     return 0 if ok else 1
 
@@ -3387,6 +3832,12 @@ def main():
                    help="skip mount-and-edit (m68ap/n45ap only; image will NOT boot as-is)")
     c.add_argument("--skip-activation", action="store_true",
                    help="leave lockdownd unpatched (m68ap/n45ap, and k48ap/n81ap/n90ap)")
+    c.add_argument("--jailbreak", action="store_true",
+                   help="leave a jailbreak on the device: afc2 and Cydia with Substrate (iPhone OS 2.0+; needs root "
+                        "and the hfsplus module; the K48 family and the other kboot boards boot with "
+                        "amfi_get_out_of_my_way=1); the bootstrap is downloaded once (SHA-1 pinned)")
+    c.add_argument("--jailbreak-cache", metavar="DIR",
+                   help="where the Cydia bootstrap is kept (default: ~/.cache/firmwarekit/Jailbreak)")
     c.add_argument("--skip-sha1", "--skip-sha1sum", dest="skip_sha1", action="store_true",
                    help="skip checking the IPSW SHA-1 hash against the catalog")
     c.add_argument("--bootrom", metavar="PATH",
