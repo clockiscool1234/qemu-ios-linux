@@ -18,8 +18,10 @@ directory and the prefix can be changed from the Settings button (saved to
      developer / beta seeds, iOS 6 / 7 on the boards that can run them); builds the
      catalog marks "coming soon" can be shown with a checkbox
   •  Per-device preferences (name, verbose boot, boot-args, RAM, USB connection,
-     window scale and rotation, extra QEMU arguments), saved in the same config
-     file and applied when the device is started
+     baseband on/off, carrier name, window scale and rotation, sound, extra QEMU
+     arguments), saved in the same config file and applied when the device is started
+  •  QEMU quits by itself when the guest powers off (switched off from the iPhone's
+     own UI); each device gets a private QMP socket for that
 
 Usage:
     python3 tools/manageFirm.py [--base /opt] [--prefix DEV_] [--downloads ~/Downloads]
@@ -42,6 +44,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -379,13 +382,40 @@ DEFAULT_PREFS = {
     "boot_args":  "",       # extra kernel boot-args (replaces iBoot's command line!)
     "ram_mb":     0,        # 0 = the machine's own RAM size; else QEMU -m <n>M
     "usb_addr":   "",       # USB-over-TCP host bridge (usbmuxd): port, host:port or socket path
+    "baseband":   "default",  # cellular modem: "default" (machine's own), "on" or "off"
+    "carrier":    "",       # carrier name shown by the phone ("" = leave the modem's own)
+    "mcc_mnc":    "",       # carrier MCC+MNC (5-6 digits), optional, goes with the name
     "scale":      "fit",    # touch-panel window scale: "fit" or a factor
     "rotate":     0,        # touch-panel rotation: 0 / 90 / 180 / 270
+    "sound":      "off",    # host audio: "off" (muted), "auto" (QEMU's own pick) or a driver name
     "extra_args": "",       # raw extra QEMU arguments
 }
-SCALE_CHOICES  = ["fit", "0.5", "0.75", "1", "1.5", "2"]
-RAM_CHOICES    = ["Default", "64", "128", "256", "512", "1024"]
-ROTATE_CHOICES = ["0", "90", "180", "270"]
+SCALE_CHOICES    = ["fit", "0.5", "0.75", "1", "1.5", "2"]
+RAM_CHOICES      = ["Default", "64", "128", "256", "512", "1024"]
+ROTATE_CHOICES   = ["0", "90", "180", "270"]
+BASEBAND_CHOICES = ["Default", "On", "Off"]
+CARRIERS = (                    # name, MCC+MNC (same presets as touchPanel.py's Network tab)
+    ("Test Network", "00101"), ("AT&T", "310410"), ("T-Mobile", "310260"),
+    ("Verizon", "311480"), ("Vodafone UK", "23415"), ("Globe", "51502"),
+    ("Smart", "51503"),
+)
+MODEM_PATH = "/machine/baseband-modem"      # QOM path of the fake modem (hw/misc/ios_baseband.c)
+
+
+# "off" keeps run.sh's `-audio driver=none`; "auto" lets QEMU use the first host driver it
+# was built with; the rest name a driver (checked against `qemu -audio help` at start).
+SOUND_CHOICES    = ["off", "auto", "pipewire", "pa", "alsa", "sdl", "jack", "oss", "coreaudio"]
+SOUND_DRIVER_RE  = re.compile(r"^[a-z][a-z0-9]*$")
+
+
+def valid_carrier(s: str) -> bool:
+    """The modem's carrier-name rule: 1-32 printable characters, no double quote."""
+    return 1 <= len(s) <= 32 and s.isprintable() and '"' not in s
+
+
+def valid_plmn(s: str) -> bool:
+    """MCC+MNC: 5 or 6 digits."""
+    return s.isdigit() and len(s) in (5, 6)
 
 
 def get_prefs(dirname: str, cfg: Optional[dict] = None) -> dict:
@@ -463,9 +493,25 @@ def validate_prefs(prefs: dict) -> list:
             errs.append("Window scale must be 'fit' or a number between 0.05 and 8.")
     if prefs.get("rotate", 0) not in (0, 90, 180, 270):
         errs.append("Rotation must be 0, 90, 180 or 270.")
+    snd = prefs.get("sound", "off")
+    if snd in ("none", "wav"):
+        errs.append("Sound: '{}' is not a host output; use Off (muted) or a real "
+                    "driver.".format(snd))
+    elif not isinstance(snd, str) or not (snd in ("off", "auto")
+                                          or SOUND_DRIVER_RE.match(snd)):
+        errs.append("Sound must be off, auto or an audio driver name (e.g. pipewire, pa, "
+                    "alsa, sdl, coreaudio).")
     usb_err = normalize_usb_addr(prefs.get("usb_addr", ""))[1]
     if usb_err:
         errs.append(usb_err)
+    if prefs.get("baseband", "default") not in ("default", "on", "off"):
+        errs.append("Baseband must be Default, On or Off.")
+    carrier = prefs.get("carrier", "")
+    if carrier and not valid_carrier(carrier):
+        errs.append("Carrier name must be 1-32 printable characters, no double quotes.")
+    plmn = prefs.get("mcc_mnc", "")
+    if plmn and not valid_plmn(plmn):
+        errs.append("MCC-MNC must be 5 or 6 digits (MCC + MNC).")
     ba = prefs.get("boot_args", "")
     if "\n" in ba or len(ba.encode()) + ba.count("%") > 250:
         errs.append("Boot-args must be one line of at most ~250 bytes (each % counts twice).")
@@ -491,6 +537,54 @@ def machine_has_property(qemu: str, machine: str, prop: str) -> bool:
         except Exception:
             _PROP_CACHE[key] = ""
     return re.search(r"(^|\s)" + re.escape(prop) + r"=", _PROP_CACHE[key]) is not None
+
+
+_AUDIO_CACHE: dict = {}
+
+
+def qemu_audio_drivers(qemu: str) -> Optional[set]:
+    """Host audio drivers this QEMU binary was built with (`qemu -audio help`, cached).
+
+    None when the list could not be read (the caller then skips the check)."""
+    if qemu not in _AUDIO_CACHE:
+        found = None
+        try:
+            r = subprocess.run([qemu, "-audio", "help"], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, errors="replace",
+                               timeout=15)
+            lines = r.stdout.splitlines()
+            if any(l.startswith("Available audio drivers") for l in lines):
+                found = {l.strip() for l in lines
+                         if SOUND_DRIVER_RE.match(l.strip())}
+        except Exception:
+            pass
+        _AUDIO_CACHE[qemu] = found
+    return _AUDIO_CACHE[qemu]
+
+
+def _sound_value(prefs: dict) -> str:
+    """The Sound preference as off / auto / a driver name; anything invalid counts as off."""
+    snd = prefs.get("sound", "off")
+    if snd in ("off", "auto"):
+        return snd
+    if isinstance(snd, str) and SOUND_DRIVER_RE.match(snd) and snd not in ("none", "wav"):
+        return snd
+    return "off"
+
+
+def _extra_sets_audio(prefs: dict) -> bool:
+    try:
+        toks = shlex.split(prefs.get("extra_args", ""))
+    except ValueError:
+        return False
+    return any(t in ("-audio", "--audio") for t in toks)
+
+
+def pref_replaces_audio(prefs: dict) -> bool:
+    """True when run.sh's `-audio driver=none` has to go: QEMU keeps the first -audio it is
+    given, so an appended one would never be heard.  (Sound off keeps the muted default
+    unless the extra QEMU arguments bring their own -audio.)"""
+    return _sound_value(prefs) != "off" or _extra_sets_audio(prefs)
 
 
 def build_pref_args(qemu: str, board: str, prefs: dict) -> tuple:
@@ -526,19 +620,303 @@ def build_pref_args(qemu: str, board: str, prefs: dict) -> tuple:
         else:
             notes.append("machine {} has no usb-tcp-addr property in this QEMU build; "
                          "USB connection ignored.".format(machine))
+    bb = prefs.get("baseband", "default")
+    if bb in ("on", "off") and machine:
+        if machine_has_property(qemu, machine, "baseband"):
+            args += ["-M", "{},baseband={}".format(machine, bb)]
+        else:
+            notes.append("machine {} has no baseband property in this QEMU build; "
+                         "baseband setting ignored.".format(machine))
+    if prefs.get("carrier", "").strip() and bb == "off":
+        notes.append("carrier name is set but the baseband is Off; the carrier is not applied.")
+    snd = _sound_value(prefs)
+    if snd != "off":
+        if _extra_sets_audio(prefs):
+            notes.append("the extra QEMU arguments already set -audio; the Sound "
+                         "preference is ignored.")
+        elif snd == "auto":
+            notes.append("sound: auto (QEMU picks the first host audio driver it was "
+                         "built with).")
+        else:
+            avail = qemu_audio_drivers(qemu)
+            if avail is not None and snd not in avail:
+                notes.append("audio driver '{}' is not built into this QEMU (have: {}); "
+                             "using auto instead.".format(
+                                 snd, ", ".join(sorted(avail - {"none"})) or "none"))
+            else:
+                args += ["-audio", "driver={}".format(snd)]
+                notes.append("sound: host audio driver {}.".format(snd))
     if prefs.get("extra_args", "").strip():
         args += shlex.split(prefs["extra_args"])
     return args, notes
 
 
-def write_args_wrapper(real_qemu: str, extra: list) -> dict:
-    """A one-line sh wrapper that runs `real_qemu "$@" <extra>`; run.sh uses it as $QEMU."""
-    tmp = tempfile.mkdtemp(prefix="qemu-ios-args-")
+# Drops run.sh's `-audio driver=none` (and any other `-audio none`) from the argument list, so
+# the -audio from the preferences, or QEMU's own default choice, is the one in effect.
+_DROP_NULL_AUDIO_SH = """\
+n=$#
+pend=0
+while [ "$n" -gt 0 ]; do
+  a=$1; shift; n=$((n-1))
+  if [ "$pend" = 1 ]; then
+    pend=0
+    case $a in
+      driver=none|driver=none,*|none|none,*) ;;
+      *) set -- "$@" -audio "$a" ;;
+    esac
+    continue
+  fi
+  if [ "$a" = -audio ]; then pend=1; continue; fi
+  set -- "$@" "$a"
+done
+"""
+
+
+def write_args_wrapper(real_qemu: str, extra: list, qmp_name: str = "",
+                       drop_null_audio: bool = False) -> dict:
+    """A one-line sh wrapper that runs `real_qemu "$@" <extra>`; run.sh uses it as $QEMU.
+
+    With `qmp_name`, the wrapper also adds `-qmp unix:<dir>/<qmp_name>,server,nowait`:
+    a QMP socket that belongs to the manager alone (QEMU takes any number of -qmp
+    monitors, and each accepts one client, so it never competes with the touch
+    panel's socket).  The socket path is returned as "sock".
+
+    With `drop_null_audio` it first removes run.sh's muted `-audio driver=none`.
+    """
+    tmp = tempfile.mkdtemp(prefix="qemu-ios-args-")     # short path: unix sockets cap at ~107 bytes
+    args = list(extra)
+    sock = ""
+    if qmp_name:
+        sock = str(Path(tmp) / qmp_name)
+        args += ["-qmp", "unix:{},server,nowait".format(sock.replace(",", ",,"))]
     w = Path(tmp) / "qemu-args.sh"
-    w.write_text("#!/bin/sh\nexec {} \"$@\" {}\n".format(
-        shlex.quote(real_qemu), " ".join(shlex.quote(a) for a in extra)))
+    body = "#!/bin/sh\n" + (_DROP_NULL_AUDIO_SH if drop_null_audio else "")
+    body += "exec {} \"$@\" {}\n".format(
+        shlex.quote(real_qemu), " ".join(shlex.quote(a) for a in args))
+    w.write_text(body)
     w.chmod(0o755)
-    return {"dir": tmp, "path": str(w)}
+    return {"dir": tmp, "path": str(w), "sock": sock}
+
+
+class QmpAgent:
+    """Watches one running device over its own QMP socket.
+
+    * Guest power-off: when the iPhone is switched off from its own UI, QEMU reports a
+      SHUTDOWN event (or sits in the "shutdown" run state, as with -no-shutdown) but a
+      machine started this way does not always exit by itself.  The agent sends QMP
+      `quit` so the QEMU process ends, which also closes the touch panel and frees the
+      device in the list.  If QEMU has not exited a few seconds after `quit`, the
+      process is terminated.
+    * Carrier: once the fake modem (/machine/baseband-modem) exists, the saved carrier
+      name (and MCC-MNC) are applied with `qom-set`, the way the touch panel's Network
+      tab does it.
+
+    Everything runs on daemon threads; `log` must be thread-safe (App.log is).
+    """
+
+    CONNECT_TIMEOUT = 120.0     # QEMU may take a while to open its monitor
+    MODEM_TIMEOUT   = 15.0      # how long to wait for the modem object to show up
+    QUIT_GRACE      = 5.0       # after `quit`: wait, then SIGTERM, then SIGKILL
+
+    def __init__(self, sock: str, proc: subprocess.Popen, log: Callable,
+                 carrier: str = "", mcc_mnc: str = "", auto_quit: bool = True) -> None:
+        self.sock, self.proc, self.log = sock, proc, log
+        self.carrier, self.mcc_mnc, self.auto_quit = carrier, mcc_mnc, auto_quit
+        self._sk = None
+        self._rf = None
+        self._wlock = threading.Lock()
+        self._plock = threading.Lock()
+        self._pending: dict = {}
+        self._next = 1
+        self._quit_started = False
+        self._seen: set = set()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name="qmp-agent", daemon=True).start()
+
+    # ── connection ────────────────────────────────────────────────────────────
+
+    def _connect(self) -> bool:
+        deadline = time.monotonic() + self.CONNECT_TIMEOUT
+        while self.proc.poll() is None and time.monotonic() < deadline:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            try:
+                s.connect(self.sock)
+            except OSError:
+                s.close()
+                time.sleep(0.25)
+                continue
+            try:
+                s.settimeout(30.0)
+                rf = s.makefile("rb")
+                greeting = json.loads(rf.readline().decode("utf-8", "replace") or "{}")
+                if "QMP" not in greeting:
+                    raise ValueError("not a QMP greeting")
+                s.sendall(b'{"execute":"qmp_capabilities"}\r\n')
+                while True:                  # events may arrive before the reply
+                    msg = json.loads(rf.readline().decode("utf-8", "replace") or "{}")
+                    if "return" in msg:
+                        break
+                    if "error" in msg or not msg:
+                        raise ValueError("qmp_capabilities failed")
+                s.settimeout(None)
+            except (OSError, ValueError):
+                s.close()
+                time.sleep(0.5)
+                continue
+            self._sk, self._rf = s, rf
+            return True
+        return False
+
+    def _send(self, obj: dict) -> None:
+        with self._wlock:
+            self._sk.sendall((json.dumps(obj) + "\r\n").encode())
+
+    def _cmd(self, name: str, args: Optional[dict] = None, timeout: float = 5.0):
+        """Run a QMP command from a worker thread (never from the reader) -> its return value."""
+        with self._plock:
+            rid = self._next
+            self._next += 1
+            slot = {"ev": threading.Event(), "msg": None}
+            self._pending[rid] = slot
+        msg = {"execute": name, "id": rid}
+        if args:
+            msg["arguments"] = args
+        try:
+            self._send(msg)
+        except OSError as exc:
+            with self._plock:
+                self._pending.pop(rid, None)
+            raise RuntimeError("send failed: {}".format(exc))
+        if not slot["ev"].wait(timeout):
+            with self._plock:
+                self._pending.pop(rid, None)
+            raise RuntimeError("{} timed out".format(name))
+        reply = slot["msg"]
+        if reply is None:
+            raise RuntimeError("connection closed")
+        if "error" in reply:
+            raise RuntimeError(reply["error"].get("desc", str(reply["error"])))
+        return reply.get("return")
+
+    # ── main loop ─────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        try:
+            if not self._connect():
+                if self.proc.poll() is None:
+                    self.log("  qmp: could not connect to QEMU's manager socket; the "
+                             "device will not quit by itself when the guest powers off.")
+                return
+            if self.carrier or self.mcc_mnc:
+                threading.Thread(target=self._apply_carrier, daemon=True).start()
+            for line in self._rf:
+                try:
+                    msg = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if "event" in msg:
+                    self._on_event(msg["event"], msg.get("data") or {})
+                    continue
+                with self._plock:
+                    slot = self._pending.pop(msg.get("id"), None)
+                if slot is not None:
+                    slot["msg"] = msg
+                    slot["ev"].set()
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self._plock:                       # wake anything still waiting
+                waiting = list(self._pending.values())
+                self._pending.clear()
+            for slot in waiting:
+                slot["ev"].set()
+            try:
+                if self._sk:
+                    self._sk.close()
+            except OSError:
+                pass
+
+    def _on_event(self, name: str, data: dict) -> None:
+        if name == "SHUTDOWN":
+            why = data.get("reason")
+            self.log("  qmp: guest powered off (SHUTDOWN{}).".format(
+                ", reason " + str(why) if why else ""))
+            self.quit()
+        elif name == "STOP":
+            threading.Thread(target=self._check_stopped, daemon=True).start()
+        elif name not in self._seen:
+            self._seen.add(name)        # each other event is logged once, to see what the machine reports
+            if name not in ("RTC_CHANGE", "NIC_RX_FILTER_CHANGED", "VNC_CONNECTED"):
+                self.log("  qmp: event {}".format(name))
+
+    def _check_stopped(self) -> None:
+        """QEMU left running in the 'shutdown' state (-no-shutdown) still counts as powered off."""
+        try:
+            status = (self._cmd("query-status") or {}).get("status")
+        except RuntimeError:
+            return
+        if status == "shutdown":
+            self.log("  qmp: guest powered off (run state 'shutdown').")
+            self.quit()
+
+    def quit(self) -> None:
+        """End QEMU: QMP quit, then SIGTERM, then SIGKILL if it lingers."""
+        if not self.auto_quit:
+            self.log("  qmp: -no-shutdown is in the extra QEMU arguments; "
+                     "leaving QEMU running.")
+            return
+        if self._quit_started:
+            return
+        self._quit_started = True
+
+        def work() -> None:
+            try:
+                self._send({"execute": "quit"})
+            except (OSError, AttributeError):
+                pass
+            for sig_name in ("terminate", "kill"):
+                try:
+                    self.proc.wait(self.QUIT_GRACE)
+                    return
+                except subprocess.TimeoutExpired:
+                    self.log("  qmp: QEMU did not exit; sending {}.".format(
+                        "SIGTERM" if sig_name == "terminate" else "SIGKILL"))
+                    try:
+                        getattr(self.proc, sig_name)()
+                    except OSError:
+                        return
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── carrier ───────────────────────────────────────────────────────────────
+
+    def _apply_carrier(self) -> None:
+        """qom-set mcc-mnc, then carrier (the name change re-announces the operator)."""
+        deadline = time.monotonic() + self.MODEM_TIMEOUT
+        while True:
+            try:
+                self._cmd("qom-list", {"path": MODEM_PATH})
+                break
+            except RuntimeError as exc:
+                if "not found" not in str(exc).lower() or time.monotonic() > deadline:
+                    self.log("  qmp: no baseband modem on this machine ({}); carrier "
+                             "not applied. Set Baseband to On in Device Preferences."
+                             .format(exc))
+                    return
+                time.sleep(0.5)
+        try:
+            if self.mcc_mnc:
+                self._cmd("qom-set", {"path": MODEM_PATH, "property": "mcc-mnc",
+                                      "value": self.mcc_mnc})
+            if self.carrier:
+                self._cmd("qom-set", {"path": MODEM_PATH, "property": "carrier",
+                                      "value": self.carrier})
+            self.log("  qmp: carrier set to {}{}.".format(
+                self.carrier or "(unchanged)",
+                " ({})".format(self.mcc_mnc) if self.mcc_mnc else ""))
+        except RuntimeError as exc:
+            self.log("  qmp: carrier not applied: {}".format(exc))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1526,6 +1904,45 @@ class DevicePrefsDialog(tk.Toplevel):
                  "default.").grid(row=row, column=1, columnspan=2, **P)
         row += 1
 
+        self._pv_baseband = tk.StringVar(
+            value=BASEBAND_CHOICES[("default", "on", "off").index(prefs["baseband"])]
+            if prefs["baseband"] in ("default", "on", "off") else "Default")
+        ttk.Label(f, text="Baseband:").grid(row=row, column=0, **P)
+        ttk.Combobox(f, textvariable=self._pv_baseband, values=BASEBAND_CHOICES,
+                     width=10, state="readonly").grid(row=row, column=1, **P)
+        ttk.Label(f, foreground="gray",
+                  text="Cellular modem (QEMU baseband=on/off)").grid(
+            row=row, column=2, **P)
+        row += 1
+        ttk.Label(
+            f, foreground="gray", wraplength=380, justify="left",
+            text="Default keeps the machine's own setting (the iPhone 2G has a modem, "
+                 "the iPhone 4 needs it switched On). Call / SMS / carrier need it On."
+        ).grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+
+        self._pv_carrier = tk.StringVar(value=prefs["carrier"])
+        self._pv_plmn = tk.StringVar(value=prefs["mcc_mnc"])
+        ttk.Label(f, text="Carrier name:").grid(row=row, column=0, **P)
+        cb = ttk.Combobox(f, textvariable=self._pv_carrier,
+                          values=[c[0] for c in CARRIERS], width=31)
+        cb.grid(row=row, column=1, columnspan=2, **P)
+        cb.bind("<<ComboboxSelected>>", self._carrier_picked)
+        row += 1
+        ttk.Label(f, text="MCC-MNC:").grid(row=row, column=0, **P)
+        ttk.Entry(f, textvariable=self._pv_plmn, width=12).grid(
+            row=row, column=1, **P)
+        ttk.Label(f, foreground="gray", text="optional, 5-6 digits").grid(
+            row=row, column=2, **P)
+        row += 1
+        ttk.Label(
+            f, foreground="gray", wraplength=380, justify="left",
+            text="Name the phone shows for its network (empty = the modem's own). "
+                 "Applied over QMP a moment after the device starts; needs the "
+                 "baseband On."
+        ).grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+
         w, h = dev.get("screen", (0, 0))
         self._pv_scale = tk.StringVar(value=str(prefs["scale"]))
         ttk.Label(f, text="Window scale:").grid(row=row, column=0, **P)
@@ -1548,6 +1965,20 @@ class DevicePrefsDialog(tk.Toplevel):
                  "window).").grid(row=row, column=1, columnspan=2, **P)
         row += 1
 
+        self._pv_sound = tk.StringVar(value=str(prefs["sound"]))
+        ttk.Label(f, text="Sound:").grid(row=row, column=0, **P)
+        ttk.Combobox(f, textvariable=self._pv_sound, values=SOUND_CHOICES,
+                     width=10).grid(row=row, column=1, **P)
+        row += 1
+        ttk.Label(
+            f, foreground="gray", wraplength=380, justify="left",
+            text="off = muted (the default). auto = the first host audio driver this QEMU "
+                 "was built with. Or type a driver name (pipewire, pa, alsa, sdl, "
+                 "coreaudio...). Applies to every board; the iPod touch 1G only "
+                 "plays its buzzer clicks. Checked when the device starts."
+        ).grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+
         self._pv_extra = tk.StringVar(value=prefs["extra_args"])
         ttk.Label(f, text="Extra QEMU args:").grid(row=row, column=0, **P)
         ttk.Entry(f, textvariable=self._pv_extra, width=34).grid(
@@ -1567,9 +1998,18 @@ class DevicePrefsDialog(tk.Toplevel):
         self._pv_boot_args.set(d["boot_args"])
         self._pv_ram.set("Default")
         self._pv_usb.set(d["usb_addr"])
+        self._pv_baseband.set("Default")
+        self._pv_carrier.set(d["carrier"])
+        self._pv_plmn.set(d["mcc_mnc"])
         self._pv_scale.set(d["scale"])
         self._pv_rotate.set(str(d["rotate"]))
+        self._pv_sound.set(d["sound"])
         self._pv_extra.set(d["extra_args"])
+
+    def _carrier_picked(self, _e=None) -> None:
+        for name, plmn in CARRIERS:
+            if name == self._pv_carrier.get():
+                self._pv_plmn.set(plmn)
 
     def _browse_usb(self) -> None:
         cur = self._pv_usb.get().strip()
@@ -1598,8 +2038,12 @@ class DevicePrefsDialog(tk.Toplevel):
             "boot_args":  self._pv_boot_args.get().strip(),
             "ram_mb":     ram,
             "usb_addr":   normalize_usb_addr(self._pv_usb.get())[0],
+            "baseband":   self._pv_baseband.get().strip().lower() or "default",
+            "carrier":    self._pv_carrier.get().strip(),
+            "mcc_mnc":    self._pv_plmn.get().strip(),
             "scale":      self._pv_scale.get().strip() or "fit",
             "rotate":     rotate,
+            "sound":      self._pv_sound.get().strip().lower() or "off",
             "extra_args": self._pv_extra.get().strip(),
         }
         errs = validate_prefs(prefs)
@@ -1882,12 +2326,18 @@ class App(tk.Tk):
         extra, notes = build_pref_args(qemu, d["board"], prefs)
         for n in notes:
             self.log("  preferences: {}".format(n))
+        # The wrapper is always used: it also gives the manager its own QMP socket, which
+        # the QmpAgent below uses to quit QEMU on guest power-off and to apply the carrier.
+        drop_audio = pref_replaces_audio(prefs)
+        aw = write_args_wrapper(env["QEMU"], extra, "mgr.sock", drop_null_audio=drop_audio)
+        env["QEMU"] = aw["path"]
+        self._argdirs[iid] = aw["dir"]
         if extra:
-            aw = write_args_wrapper(env["QEMU"], extra)
-            env["QEMU"] = aw["path"]
-            self._argdirs[iid] = aw["dir"]
             self.log("  preferences: QEMU extra args: {}".format(
                 " ".join(shlex.quote(a) for a in extra)))
+        if drop_audio:
+            self.log("  preferences: run.sh's muted audio (-audio driver=none) "
+                     "is replaced.")
         if not panel and (prefs["scale"] != "fit" or prefs["rotate"]):
             self.log("  preferences: window scale / rotation only apply to the "
                      "touch panel; it is off, so they are ignored.")
@@ -1905,6 +2355,14 @@ class App(tk.Tk):
             self._running[iid] = proc
             self.refresh()
             self.log("  PID {} launched.".format(proc.pid))
+            try:
+                extra_tokens = shlex.split(prefs.get("extra_args", ""))
+            except ValueError:
+                extra_tokens = []
+            QmpAgent(aw["sock"], proc, self.log,
+                     carrier=prefs.get("carrier", "").strip(),
+                     mcc_mnc=prefs.get("mcc_mnc", "").strip(),
+                     auto_quit="-no-shutdown" not in extra_tokens).start()
             if panel:
                 panel["title"] = label
                 panel["scale"] = prefs["scale"]
