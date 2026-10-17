@@ -824,6 +824,70 @@ def check(path, mbr=None, system=None, geometry=None):
     return not fails
 
 
+# --- dump: read a partition back out of the finished NAND -------------------------------------
+
+def logical_pages(path, geometry=None):
+    """(Store, Geo, {lpn: vpn}): the FTL's logical-to-virtual page map as check() rebuilds it from the index pages."""
+    if geometry is None:
+        import json
+        g = json.load(open(os.path.join(path, "geometry.json")))
+        geometry = next((k for k, v in GEOMETRIES.items()
+                         if (v["num_bus"], v["ce_per_bus"], v["blocks_per_ce"], v["pages_per_block"], v["page_size"])
+                         == (g["buses"], g["ce_per_bus"], g["blocks_per_ce"], g["pages_per_block"], g["page_bytes"])), None)
+        if not geometry:
+            raise SystemExit("%s: no known geometry matches geometry.json" % path)
+    geo = Geo(name=geometry, **GEOMETRIES[geometry])
+    st = Store(path, geo)
+    toc_from_index = {}
+    for v in range(geo.num_blocks):
+        base = v * geo.ppsublk
+        d, m = st.read_vpn(base)
+        if d is None or m[9] != T_INDEX:
+            continue
+        for j in range(geo.ppsublk):
+            pd, pm = st.read_vpn(base + j)
+            if pd is None or pm[9] & T_CLOSED:
+                break
+            toc_from_index[struct.unpack_from("<I", pm)[0]] = array.array("I", pd)
+    rebuilt = {}
+    for t, arr in toc_from_index.items():
+        for i, vpn in enumerate(arr):
+            if vpn != UNMAPPED:
+                rebuilt[t * geo.toc_entries + i] = vpn
+    return st, geo, rebuilt
+
+
+def dump_partition(path, out, part=1, against=None):
+    """Write partition `part` (1-based, from the MBR in LBA 0) of the NAND at `path` to the file `out`, a raw volume.
+    Pages the FTL never mapped are zeros.  With `against` (a raw image), also count the pages that differ from it."""
+    st, geo, rebuilt = logical_pages(path)
+    if 0 not in rebuilt:
+        raise SystemExit("%s: LBA 0 is not mapped; is this the right directory?" % path)
+    parts = mbr_parts(st.read_vpn(rebuilt[0])[0])
+    typ, lba, cnt = parts[part - 1]
+    if not typ:
+        raise SystemExit("partition %d is empty" % part)
+    zero, holes, diff, first = bytes(geo.page_size), 0, 0, []
+    ref = open(against, "rb") if against else None
+    with open(out, "wb") as f:
+        for n in range(cnt):
+            vpn = rebuilt.get(lba + n)
+            data = zero if vpn is None else st.read_vpn(vpn)[0]
+            holes += vpn is None
+            f.write(data)
+            if ref:
+                want = ref.read(geo.page_size).ljust(geo.page_size, b"\0")
+                if want != data and b"/dev/disk0s2" not in data:       # the fstab rewrite is deliberate
+                    diff += 1
+                    if len(first) < 10:
+                        first.append(n)
+    print("partition %d: type %02x, LBA %d, %d pages (%d MiB), %d never written -> %s"
+          % (part, typ, lba, cnt, cnt * geo.page_size >> 20, holes, out))
+    if ref:
+        print("%d pages differ from %s%s" % (diff, against, (" (first: %s)" % first) if first else ""))
+    return diff == 0
+
+
 # --- selfcheck ---------------------------------------------------------------
 
 def selfcheck():
@@ -849,6 +913,12 @@ def selfcheck():
                                    s3=None, data=paths["data.img"], out=os.path.join(work, "nand"), force=True,
                                    kernelcache=None, kernel_version=b"Darwin Kernel Version selfcheck"))
     good = check(out, mbr=paths["mbr"], system=paths["system.img"])
+    dumped = os.path.join(work, "dump.img")
+    good &= dump_partition(out, dumped, 1, paths["system.img"])
+    got = open(dumped, "rb").read()
+    ref = open(paths["system.img"], "rb").read()      # as written (the fstab line above overran its 60 bytes)
+    good &= len(got) == 700 * ps and got[:300 * ps] == ref[:300 * ps] and got[301 * ps:] == ref[301 * ps:700 * ps]
+    print("dump reproduces the system image (apart from the fstab page):", good)
     # the fstab rewrite must have landed
     geo = Geo(name="selfcheck", **GEOMETRIES["selfcheck"])
     st = Store(out, geo)
@@ -897,6 +967,12 @@ def main():
     m.add_argument("--geometry", default="k48-16g", choices=[k for k in GEOMETRIES if k != "selfcheck"])
     m.add_argument("--system-mib", type=int, default=1280)
     m.add_argument("out")
+    d = sub.add_parser("dump", help="read a partition back out of a finished NAND directory as a raw volume")
+    d.add_argument("dir")
+    d.add_argument("out")
+    d.add_argument("--part", type=int, default=1, help="partition number from the MBR (default 1: the system volume)")
+    d.add_argument("--against", help="raw image to compare page by page (e.g. the system image the NAND was built from)")
+    d.add_argument("--no-whitening", action="store_true")
     c = sub.add_parser("check")
     c.add_argument("dir")
     c.add_argument("--no-whitening", action="store_true")
@@ -916,6 +992,8 @@ def main():
             f.write(make_mbr(Geo(name=a.geometry, **GEOMETRIES[a.geometry]), a.system_mib))
     elif a.cmd == "check":
         sys.exit(0 if check(a.dir, a.mbr, a.system) else 1)
+    elif a.cmd == "dump":
+        sys.exit(0 if dump_partition(a.dir, a.out, a.part, a.against) else 1)
     else:
         ap.print_help()
 

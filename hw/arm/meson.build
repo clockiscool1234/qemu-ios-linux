@@ -113,9 +113,10 @@ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
 
 arm_common_ss.add(files('boot.c'))
 
-# gles-host.c is one renderer with two context backends: a legacy CGL context
-# on macOS (created in gles-host.c itself) and an EAGLContext on iOS
-# (gles-host-eagl.m). It picks between them on TARGET_OS_IPHONE, so the choice
+# gles-host.c is one renderer with three context backends: a legacy CGL context
+# on macOS (created in gles-host.c itself), an EAGLContext on iOS
+# (gles-host-eagl.m), and EGL on Linux (gles-host-egl.c.inc, #included, selected
+# by -DGLES_HOST_EGL from the ltm_host_egl option). It picks between them on TARGET_OS_IPHONE, so the choice
 # here is only which framework and which extra file to add. A host with neither
 # framework gets a stub and the guest's GLES HLE probe fails cleanly.
 if host_opengl.found() or host_gles.found()

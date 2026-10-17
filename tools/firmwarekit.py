@@ -2218,6 +2218,10 @@ def activate_kboot_rootfs(system_img, work, log=print):
         print("warning: lockdownd was NOT activated (%s)" % e)
         print("         rerun as root, or pass --skip-activation to silence this")
         return None
+    except OSError as e:     # e.g. ENOSPC: the HFS+ volume inside the image is full (a decmpfs lockdownd is rewritten)
+        print("warning: lockdownd was NOT activated (%s)" % e)
+        print("         the volume inside the image has no room for the patched file; the bundle is built unactivated")
+        return None
     finally:
         try:
             os.rmdir(mnt)
@@ -2270,7 +2274,11 @@ def create_kboot(args, entry, ipsw, ri, out, work):
 
     # 4b. lockdownd activation (A4 boards, iOS 4.x/5.x): patch the signed lockdownd in the rootfs and
     #     re-sign it, like FirmwareKit's SystemEdits.activate.  Needs root + the Linux hfsplus module.
-    if board in _ACTIVATED_KBOOT and not getattr(args, "skip_activation", False):
+    ios_major = int((entry.get("version", "0").split(".")[0] or "0")) if entry.get("version", "0")[:1].isdigit() else 0
+    if board in _ACTIVATED_KBOOT and ios_major >= 6 and not getattr(args, "skip_activation", False):
+        print("note: iOS %s: lockdownd is left stock (the patch is for iOS 3.x-5.x; 6.x+ keeps activation state in "
+              "data_ark.plist)" % entry.get("version"))
+    elif board in _ACTIVATED_KBOOT and not getattr(args, "skip_activation", False):
         activate_kboot_rootfs(system_img, work)
 
     # 5. Build NAND store

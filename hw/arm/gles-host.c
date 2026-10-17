@@ -61,12 +61,24 @@
  * glOrtho/glFrustum/glClearDepth take doubles on the desktop and floats in ES.
  * Nothing here is a reimplementation; each shim below is a rename.
  */
+#ifdef __APPLE__
 #include <TargetConditionals.h>
 #if !TARGET_OS_IPHONE
 #include <VideoToolbox/VideoToolbox.h>
 #endif
+#endif
 
-#if TARGET_OS_IPHONE || defined(GLES_HOST_ANGLE)
+/*
+ * A third host, Linux (GLES_HOST_EGL, gles-host-egl.c.inc): EGL creating a
+ * desktop compatibility-profile context. It takes the macOS/CGL branch of
+ * everything below -- same fixed-function desktop GL, same readback present --
+ * and only swaps who makes the context. GLES_HOST_EAGL stays undefined for it.
+ */
+#if defined(GLES_HOST_EGL) && (defined(__APPLE__) || defined(GLES_HOST_ANGLE))
+#error "GLES_HOST_EGL is the Linux backend; it excludes CGL, EAGL and ANGLE"
+#endif
+
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(GLES_HOST_ANGLE)
 #define GLES_HOST_EAGL 1
 #endif
 
@@ -177,6 +189,20 @@ bool gles_eagl_iosurface_bind(uint32_t width, uint32_t height,
                               unsigned long format, unsigned long type);
 void *gles_eagl_iosurface_lock(size_t *stride);
 void gles_eagl_iosurface_unlock(void);
+
+#elif defined(GLES_HOST_EGL) /* Linux: EGL + desktop compatibility profile */
+
+#define GL_GLEXT_PROTOTYPES 1
+#include <GL/gl.h>
+#include <GL/glext.h>
+#include "gles-host-egl.c.inc"
+
+/* Some libGL builds (seen on Alpine/musl Mesa) do not export the EXT alias of
+ * the blit, only the core GL 3.0 entry point, which has the same signature and
+ * tokens. A compatibility context always has it. */
+#define glBlitFramebufferEXT          glBlitFramebuffer
+
+#define GLES_BGRA_READ_TYPE           GL_UNSIGNED_INT_8_8_8_8_REV
 
 #else /* macOS: legacy CGL */
 
@@ -545,9 +571,10 @@ static Error *gles_save_blocker;
 
 static bool gles_begin_context(void)
 {
-#ifdef GLES_HOST_EAGL
+#if defined(GLES_HOST_EAGL) || defined(GLES_HOST_EGL)
     /* The CGL backend saves live GL state (gles-host-snapshot.c.inc); the
-     * iOS-host EAGL backend cannot yet. */
+     * iOS-host EAGL backend cannot yet, and neither does the Linux EGL one
+     * (snapshotting was written and measured against CGL only). */
     if (!qatomic_read(&gles_live_contexts)) {
         error_setg(&gles_save_blocker,
                    "Live OpenGL ES state cannot be saved (including accelerated system UI)");
@@ -671,6 +698,46 @@ static void gles_platform_make_current(void) { CGLSetCurrentContext(gh.cgl); }
 static bool gles_platform_attach_iosurface(void) { return false; }
 static void *gles_platform_frame_lock(size_t *stride) { return NULL; }
 static void gles_platform_frame_unlock(void) {}
+
+#elif defined(GLES_HOST_EGL)
+
+static bool gles_platform_context_create(void)
+{
+    if (!gles_egl_create(gh.group ? gh.group->root : NULL, &gh.cgl)) {
+        return false;
+    }
+    if (gh.group && !gh.group->root) {
+        gh.group->root = CGLRetainContext(gh.cgl);
+    }
+    if (CGLSetCurrentContext(gh.cgl) != 0) {
+        fprintf(stderr, "[gles-egl] eglMakeCurrent failed (0x%x)\n", eglGetError());
+        return false;
+    }
+    return true;
+}
+
+/* All requests arrive on the one vCPU thread, so after the first this is a
+ * thread-local compare, as with CGL. */
+static inline void gles_platform_make_current(void)
+{
+    CGLSetCurrentContext(gh.cgl);
+}
+
+/* Readback present only: there is no IOSurface here, and an immediate-mode
+ * desktop driver does not have the tiler's glReadPixels problem it exists for. */
+static bool gles_platform_attach_iosurface(void)
+{
+    return false;
+}
+
+static inline void *gles_platform_frame_lock(size_t *stride)
+{
+    return NULL;
+}
+
+static inline void gles_platform_frame_unlock(void)
+{
+}
 
 #elif defined(GLES_HOST_EAGL)
 
@@ -3996,7 +4063,54 @@ static bool gles_surface_read(CPUState *cpu, uint32_t base, uint32_t stride,
     return true;
 }
 
-#ifndef GLES_HOST_EAGL
+#if !defined(GLES_HOST_EAGL) && !defined(__APPLE__)
+/*
+ * NV12 (420v video range / 420f full range, BT.601) to BGRA on the CPU. The
+ * macOS host hands this to VideoToolbox; there is no such thing elsewhere, and
+ * the conversion is a few multiplies per pixel on a surface that is decoded
+ * once per bind. Same contract as the VideoToolbox version: `input` is the
+ * luma plane (w*h) followed by the interleaved CbCr plane (w * h/2), `bgra`
+ * receives w*h*4 bytes in B,G,R,A order.
+ */
+static bool gles_surface_nv12(unsigned w, unsigned h, uint32_t format,
+                              uint8_t *input, uint8_t *bgra)
+{
+    const bool full = format == 0x34323066;     /* '420f' */
+    const uint8_t *luma = input, *chroma = input + (size_t)w * h;
+
+    if ((w | h) & 1) {
+        return false;
+    }
+    for (unsigned y = 0; y < h; y++) {
+        const uint8_t *yrow = luma + (size_t)y * w;
+        const uint8_t *crow = chroma + (size_t)(y / 2) * w;
+        uint8_t *out = bgra + (size_t)y * w * 4;
+
+        for (unsigned x = 0; x < w; x++) {
+            int d = crow[x & ~1u] - 128;        /* Cb */
+            int e = crow[x | 1u] - 128;         /* Cr */
+            int r, g, b;
+
+            if (full) {
+                int c = yrow[x] << 8;
+                r = (c + 359 * e + 128) >> 8;
+                g = (c - 88 * d - 183 * e + 128) >> 8;
+                b = (c + 454 * d + 128) >> 8;
+            } else {
+                int c = (yrow[x] - 16) * 298;
+                r = (c + 409 * e + 128) >> 8;
+                g = (c - 100 * d - 208 * e + 128) >> 8;
+                b = (c + 516 * d + 128) >> 8;
+            }
+            out[x * 4 + 0] = MIN(MAX(b, 0), 255);
+            out[x * 4 + 1] = MIN(MAX(g, 0), 255);
+            out[x * 4 + 2] = MIN(MAX(r, 0), 255);
+            out[x * 4 + 3] = 0xff;
+        }
+    }
+    return true;
+}
+#elif !defined(GLES_HOST_EAGL)
 static bool gles_surface_nv12(unsigned w, unsigned h, OSType format,
                               uint8_t *input, uint8_t *bgra)
 {
@@ -4023,6 +4137,78 @@ done:
     if (dest) CVPixelBufferRelease(dest);
     if (source) CVPixelBufferRelease(source);
     return ok;
+}
+#endif
+
+#if defined(GLES_HOST_EGL)
+/*
+ * APPLE_fence, emulated with GL sync objects (GL 3.2 / ARB_sync, which a Mesa
+ * compatibility context has). Names are handed out here, not by the host: the
+ * table maps a guest fence name to the GLsync made by its last glSetFence.
+ */
+static GHashTable *gles_fences;     /* guest name -> GLsync, or NULL if never set */
+static GLuint gles_fence_next = 1;
+
+static GLuint gles_fence_name(void)
+{
+    if (!gles_fences) gles_fences = g_hash_table_new(g_direct_hash, g_direct_equal);
+    GLuint name = gles_fence_next++;
+    g_hash_table_insert(gles_fences, GUINT_TO_POINTER(name), NULL);
+    return name;
+}
+
+static void gles_fence_delete(GLuint name)
+{
+    gpointer sync;
+    if (gles_fences && g_hash_table_lookup_extended(gles_fences, GUINT_TO_POINTER(name), NULL, &sync)) {
+        if (sync) glDeleteSync((GLsync)sync);
+        g_hash_table_remove(gles_fences, GUINT_TO_POINTER(name));
+    }
+}
+
+static void gles_fence_set(GLuint name)
+{
+    gpointer old;
+    if (!gles_fences || !g_hash_table_lookup_extended(gles_fences, GUINT_TO_POINTER(name), NULL, &old)) {
+        return;                                 /* not a fence: GL_INVALID_OPERATION on Apple */
+    }
+    if (old) glDeleteSync((GLsync)old);
+    g_hash_table_insert(gles_fences, GUINT_TO_POINTER(name),
+                        glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
+}
+
+static bool gles_fence_is(GLuint name)
+{
+    return gles_fences && g_hash_table_contains(gles_fences, GUINT_TO_POINTER(name));
+}
+
+/* True once the fence's work has finished (or if it was never set). */
+static bool gles_fence_test(GLuint name)
+{
+    GLsync sync = gles_fences ? g_hash_table_lookup(gles_fences, GUINT_TO_POINTER(name)) : NULL;
+    GLenum r;
+
+    if (!sync) return true;
+    r = glClientWaitSync(sync, 0, 0);
+    return r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED;
+}
+
+static void gles_fence_finish(GLuint name)
+{
+    GLsync sync = gles_fences ? g_hash_table_lookup(gles_fences, GUINT_TO_POINTER(name)) : NULL;
+
+    if (sync) glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+}
+
+/* glTestObjectAPPLE: have all commands issued so far finished? Conservative
+ * for any one object, which is the safe direction for a poll loop. */
+static bool gles_fence_test_object(void)
+{
+    GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    GLenum r = glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+
+    glDeleteSync(sync);
+    return r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED;
 }
 #endif
 
@@ -6747,6 +6933,7 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
         return gles_write_xparams(cpu, a[1], 0, 4, p);
     }
 
+#ifdef __APPLE__
     /* APPLE_fence, which the desktop has under the same names. Every engine of
      * these firmwares fills the eight; game engines fence their streamed
      * vertex buffers with them. */
@@ -6781,6 +6968,42 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
     case 468: glFinishFenceAPPLE(a[0]); return 0;
     case 469: return glTestObjectAPPLE(a[0], a[1]);
     case 470: glFinishObjectAPPLE(a[0], a[1]); return 0;
+#else
+    /* No APPLE_fence outside macOS: emulate it with GL sync objects, which keep
+     * the same meaning (a fence is a point in the command stream that is either
+     * complete or not). The guest's names are ours; GLsync is the host's. */
+    case 463: {                                 /* glGenFencesAPPLE(n, fences*) */
+        uint32_t n = a[0];
+        g_autofree GLuint *ids = NULL;
+        if (n > GLES_MAX_NAMES) {
+            gles_refuse("cap:glGenFencesAPPLE");
+            return -1;
+        }
+        ids = g_new0(GLuint, n ? n : 1);
+        for (uint32_t i = 0; i < n; i++) ids[i] = gles_fence_name();
+        if (a[1] && n) gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(GLuint), 1);
+        return 0;
+    }
+    case 464: {                                 /* glDeleteFencesAPPLE(n, fences*) */
+        uint32_t n = a[0];
+        g_autofree GLuint *ids = NULL;
+        if (!n || !a[1]) return 0;
+        if (n > GLES_MAX_NAMES) {
+            gles_refuse("cap:glDeleteFencesAPPLE");
+            return -1;
+        }
+        ids = g_new0(GLuint, n);
+        if (gles_guest_rw(cpu, a[1], (uint8_t *)ids, n * sizeof(GLuint), 0)) return -1;
+        for (uint32_t i = 0; i < n; i++) gles_fence_delete(ids[i]);
+        return 0;
+    }
+    case 465: gles_fence_set(a[0]); return 0;
+    case 466: return gles_fence_is(a[0]);
+    case 467: return gles_fence_test(a[0]);
+    case 468: gles_fence_finish(a[0]); return 0;
+    case 469: return gles_fence_test_object();
+    case 470: glFinish(); return 0;
+#endif
 #endif
 
     /* ---- lighting and fog ---- */
@@ -7481,7 +7704,7 @@ static int64_t gles_context_operation(unsigned slot, unsigned ctx, unsigned argc
 }
 
 static void gles_drop_all(void);
-#ifdef GLES_HOST_ANGLE
+#if defined(GLES_HOST_ANGLE) || defined(GLES_HOST_EGL)
 static void gles_snapshot_register(void) {} /* migration blocker is held for live EGL state */
 #else
 #include "gles-host-snapshot.c.inc"

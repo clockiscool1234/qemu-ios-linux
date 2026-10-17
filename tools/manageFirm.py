@@ -17,9 +17,9 @@ directory and the prefix can be changed from the Settings button (saved to
   •  Every build in firmware-catalog.json is offered per device (final releases,
      developer / beta seeds, iOS 6 / 7 on the boards that can run them); builds the
      catalog marks "coming soon" can be shown with a checkbox
-  •  Per-device preferences (name, verbose boot, boot-args, RAM, window scale and
-     rotation, extra QEMU arguments), saved in the same config file and applied
-     when the device is started
+  •  Per-device preferences (name, verbose boot, boot-args, RAM, USB connection,
+     window scale and rotation, extra QEMU arguments), saved in the same config
+     file and applied when the device is started
 
 Usage:
     python3 tools/manageFirm.py [--base /opt] [--prefix DEV_] [--downloads ~/Downloads]
@@ -378,6 +378,7 @@ DEFAULT_PREFS = {
     "verbose":    False,    # iOS verbose boot ("-v" in the kernel command line)
     "boot_args":  "",       # extra kernel boot-args (replaces iBoot's command line!)
     "ram_mb":     0,        # 0 = the machine's own RAM size; else QEMU -m <n>M
+    "usb_addr":   "",       # USB-over-TCP host bridge (usbmuxd): port, host:port or socket path
     "scale":      "fit",    # touch-panel window scale: "fit" or a factor
     "rotate":     0,        # touch-panel rotation: 0 / 90 / 180 / 270
     "extra_args": "",       # raw extra QEMU arguments
@@ -411,6 +412,42 @@ def save_prefs(dirname: str, prefs: dict) -> None:
     save_config(cfg)
 
 
+UNIX_SOCKET_PATH_MAX = 103      # sun_path is 104 bytes on macOS / 108 on Linux, with the NUL
+
+
+def normalize_usb_addr(text: str) -> tuple:
+    """Check a USB connection setting -> (normalized value, error or "").
+
+    Accepts what QEMU's `usb-tcp-addr` takes, plus a bare port:
+        ""                  no link (the machine's own default)
+        1235 / :1235        -> 127.0.0.1:1235
+        host:port           a TCP bridge (usbmuxd's USBMUXD_QEMU_ADDR)
+        /path/to/socket     the bridge's Unix socket
+    QEMU is the client, so the bridge (usbmuxd) must be the one listening.
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+    if re.search(r"[\r\n\0]", t):
+        return t, "USB connection must be a single line."
+    if t.startswith("/"):
+        if len(t.encode()) > UNIX_SOCKET_PATH_MAX:
+            return t, ("USB socket path is too long for a Unix socket "
+                       "(at most {} bytes).".format(UNIX_SOCKET_PATH_MAX))
+        return t, ""
+    if t.startswith("~"):
+        return t, "USB socket path must be absolute (a leading ~ is not expanded)."
+    host, sep, port = t.rpartition(":")
+    if not sep:                      # a bare port
+        host, port = "", t
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        return t, ("USB connection must be a port (1-65535), host:port, or an "
+                   "absolute path to a Unix socket.")
+    if re.search(r"[\s,=]", host):
+        return t, "USB host must not contain spaces, commas or '='."
+    return "{}:{}".format(host or "127.0.0.1", int(port)), ""
+
+
 def validate_prefs(prefs: dict) -> list:
     """Problems with a preferences dict, as human-readable strings ([] when fine)."""
     errs = []
@@ -426,6 +463,9 @@ def validate_prefs(prefs: dict) -> list:
             errs.append("Window scale must be 'fit' or a number between 0.05 and 8.")
     if prefs.get("rotate", 0) not in (0, 90, 180, 270):
         errs.append("Rotation must be 0, 90, 180 or 270.")
+    usb_err = normalize_usb_addr(prefs.get("usb_addr", ""))[1]
+    if usb_err:
+        errs.append(usb_err)
     ba = prefs.get("boot_args", "")
     if "\n" in ba or len(ba.encode()) + ba.count("%") > 250:
         errs.append("Boot-args must be one line of at most ~250 bytes (each % counts twice).")
@@ -475,6 +515,17 @@ def build_pref_args(qemu: str, board: str, prefs: dict) -> tuple:
         else:
             notes.append("machine {} has no boot-args property in this QEMU build; "
                          "verbose / boot-args ignored.".format(machine))
+    usb, usb_err = normalize_usb_addr(prefs.get("usb_addr", ""))
+    if usb and not usb_err and machine:
+        if machine_has_property(qemu, machine, "usb-tcp-addr"):
+            opts = "{},usb-tcp-addr={}".format(machine, usb.replace(",", ",,"))
+            # The A4 machines default the cable to attached; the others need it said.
+            if machine_has_property(qemu, machine, "usb-attached"):
+                opts += ",usb-attached=on"
+            args += ["-M", opts]
+        else:
+            notes.append("machine {} has no usb-tcp-addr property in this QEMU build; "
+                         "USB connection ignored.".format(machine))
     if prefs.get("extra_args", "").strip():
         args += shlex.split(prefs["extra_args"])
     return args, notes
@@ -1459,6 +1510,22 @@ class DevicePrefsDialog(tk.Toplevel):
                       dev.get("ram_mb", "?"))).grid(row=row, column=2, **P)
         row += 1
 
+        self._pv_usb = tk.StringVar(value=prefs["usb_addr"])
+        ttk.Label(f, text="USB connection:").grid(row=row, column=0, **P)
+        uf = ttk.Frame(f)
+        uf.grid(row=row, column=1, columnspan=2, **P)
+        ttk.Entry(uf, textvariable=self._pv_usb, width=26).pack(side="left")
+        ttk.Button(uf, text="Browse\u2026", command=self._browse_usb).pack(
+            side="left", padx=(6, 0))
+        row += 1
+        ttk.Label(
+            f, foreground="gray", wraplength=380, justify="left",
+            text="Where the device's USB goes: a port (1235), host:port, or the path "
+                 "of a Unix socket. A usbmuxd with USBMUXD_QEMU_ADDR set to the same "
+                 "value must be listening (QEMU dials out). Empty = the machine's "
+                 "default.").grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+
         w, h = dev.get("screen", (0, 0))
         self._pv_scale = tk.StringVar(value=str(prefs["scale"]))
         ttk.Label(f, text="Window scale:").grid(row=row, column=0, **P)
@@ -1499,9 +1566,19 @@ class DevicePrefsDialog(tk.Toplevel):
         self._pv_verbose.set(d["verbose"])
         self._pv_boot_args.set(d["boot_args"])
         self._pv_ram.set("Default")
+        self._pv_usb.set(d["usb_addr"])
         self._pv_scale.set(d["scale"])
         self._pv_rotate.set(str(d["rotate"]))
         self._pv_extra.set(d["extra_args"])
+
+    def _browse_usb(self) -> None:
+        cur = self._pv_usb.get().strip()
+        start = Path(cur).parent if cur.startswith("/") and Path(cur).parent.is_dir() \
+            else Path.home()
+        p = filedialog.askopenfilename(parent=self, initialdir=str(start),
+                                       title="Select the bridge's Unix socket")
+        if p:
+            self._pv_usb.set(p)
 
     def _save(self) -> None:
         ram_txt = self._pv_ram.get().strip()
@@ -1520,6 +1597,7 @@ class DevicePrefsDialog(tk.Toplevel):
             "verbose":    bool(self._pv_verbose.get()),
             "boot_args":  self._pv_boot_args.get().strip(),
             "ram_mb":     ram,
+            "usb_addr":   normalize_usb_addr(self._pv_usb.get())[0],
             "scale":      self._pv_scale.get().strip() or "fit",
             "rotate":     rotate,
             "extra_args": self._pv_extra.get().strip(),

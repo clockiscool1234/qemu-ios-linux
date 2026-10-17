@@ -66,6 +66,8 @@ meson_options_help() {
   printf "%s\n" '  --libexecdir=VALUE       Library executable directory [libexec]'
   printf "%s\n" '  --localedir=VALUE        Locale data directory [share/locale]'
   printf "%s\n" '  --localstatedir=VALUE    Localstate data directory [/var/local]'
+  printf "%s\n" '  --ltm-angle-prefix=VALUE Experimental ES1 ANGLE build prefix (same guest'
+  printf "%s\n" '                           executor, no snapshots)'
   printf "%s\n" '  --mandir=VALUE           Manual page directory [share/man]'
   printf "%s\n" '  --prefix=VALUE           Installation prefix [/usr/local]'
   printf "%s\n" '  --qemu-ga-distro=VALUE   second path element in qemu-ga registry entries'
@@ -148,6 +150,8 @@ meson_options_help() {
   printf "%s\n" '  libvduse        build VDUSE Library'
   printf "%s\n" '  linux-aio       Linux AIO support'
   printf "%s\n" '  linux-io-uring  Linux io_uring support'
+  printf "%s\n" '  ltm-host-egl    Linux host OpenGL for the iPod Touch GLES bridge, through'
+  printf "%s\n" '                  EGL (needs egl and gl pkg-config files)'
   printf "%s\n" '  lzfse           lzfse support for DMG images'
   printf "%s\n" '  lzo             lzo compression support'
   printf "%s\n" '  malloc-trim     enable libc malloc_trim() for memory optimization'
@@ -395,6 +399,9 @@ _meson_option_parse() {
     --disable-linux-io-uring) printf "%s" -Dlinux_io_uring=disabled ;;
     --localedir=*) quote_sh "-Dlocaledir=$2" ;;
     --localstatedir=*) quote_sh "-Dlocalstatedir=$2" ;;
+    --ltm-angle-prefix=*) quote_sh "-Dltm_angle_prefix=$2" ;;
+    --enable-ltm-host-egl) printf "%s" -Dltm_host_egl=enabled ;;
+    --disable-ltm-host-egl) printf "%s" -Dltm_host_egl=disabled ;;
     --enable-lzfse) printf "%s" -Dlzfse=enabled ;;
     --disable-lzfse) printf "%s" -Dlzfse=disabled ;;
     --enable-lzo) printf "%s" -Dlzo=enabled ;;

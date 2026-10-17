@@ -81,9 +81,14 @@ python = import('python').find_installation()
 
 cc = meson.get_compiler('c')
 all_languages = ['c']
-# Darwin's guest GL executor uses Imagination's reference PVRTC decoder.
-enable_cpp = host_os in ['windows', 'darwin'] or get_option('plugins')
-if enable_cpp and add_languages('cpp', required: host_os == 'darwin', native: false)
+# The guest GL executor uses Imagination's reference PVRTC decoder (C++), on
+# Darwin and on Linux hosts that build the EGL GL bridge (ltm_host_egl).
+ltm_host_egl = get_option('ltm_host_egl')
+ltm_egl_cpp = host_os == 'linux' and ltm_host_egl.allowed()
+enable_cpp = host_os in ['windows', 'darwin'] or get_option('plugins') or ltm_egl_cpp
+if enable_cpp and add_languages('cpp',
+                                required: host_os == 'darwin' or (ltm_egl_cpp and ltm_host_egl.enabled()),
+                                native: false)
   all_languages += ['cpp']
   cxx = meson.get_compiler('cpp')
 endif
@@ -1235,6 +1240,20 @@ if angle_prefix != ''
   endif
   host_opengl = declare_dependency(compile_args: ['-DGLES_HOST_ANGLE=1', '-I' + angle_prefix / 'include'],
     link_args: ['-L' + angle_prefix / 'out/ltm-metal', '-Wl,-rpath,' + angle_prefix / 'out/ltm-metal', '-lEGL', '-lGLESv2'])
+endif
+# Linux: EGL creating a desktop compatibility-profile context (Mesa, or any
+# vendor driver with EGL_OPENGL_API). Same renderer and the same readback
+# present as the macOS path; see hw/arm/gles-host-egl.c.inc. Needs no window
+# system -- the Mesa surfaceless platform is enough -- so a headless host works.
+if not host_opengl.found() and host_os == 'linux'
+  if ltm_host_egl.allowed() and 'cpp' in all_languages
+    ltm_egl_dep = dependency('egl', required: ltm_host_egl)
+    ltm_gl_dep = dependency('gl', required: ltm_host_egl)
+    if ltm_egl_dep.found() and ltm_gl_dep.found()
+      host_opengl = declare_dependency(compile_args: ['-DGLES_HOST_EGL=1'],
+                                       dependencies: [ltm_egl_dep, ltm_gl_dep])
+    endif
+  endif
 endif
 # IOSurface (and the CoreFoundation dictionary that configures one) is not
 # optional garnish here: it is the render target the iOS present path reads,

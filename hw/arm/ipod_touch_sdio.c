@@ -394,7 +394,7 @@ static void sdpcm_send_event(IPodTouchSDIOState *s, uint32_t event_type,
 /* The BSSID and SSID the model pretends to be associated with. The BSSID is
  * the "bssid" property (s->bssid); this is its default. */
 static const uint8_t default_bssid[6] = { 0x02, 0x00, 0x5e, 0x10, 0x00, 0x01 };
-#define FAKE_SSID "qemu-ios"
+#define FAKE_SSID "FakeWiFi"
 
 /* Describe the network the model claims to be on, open and on channel 6. */
 static void fill_bss_info(IPodTouchSDIOState *s, uint8_t *bi)

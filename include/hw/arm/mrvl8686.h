@@ -92,7 +92,7 @@
 #define MRVL_RXPD_LEN           20
 
 /* The one access point: open, 802.11b/g, channel 6. */
-#define MRVL_AP_SSID            "Belkin_Setup"
+#define MRVL_AP_SSID            "FakeWiFi"
 #define MRVL_AP_CHANNEL         6
 
 #define MRVL_UPQ_SLOTS          16

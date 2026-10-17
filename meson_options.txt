@@ -394,3 +394,4 @@ option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
 
 option('ltm_angle_prefix', type: 'string', value: '', description: 'Experimental ES1 ANGLE build prefix (same guest executor, no snapshots)')
+option('ltm_host_egl', type: 'feature', value: 'auto', description: 'Linux host OpenGL for the iPod Touch GLES bridge, through EGL (needs egl and gl pkg-config files)')
