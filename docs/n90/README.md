@@ -25,6 +25,10 @@ with persistence all work.
   (`mt_profile_n81`, `mt_tx_fifo` 64 KiB).
 - Activation: the 8C148 offline-activation hook from the iPad and N81. The iPhone's lockdownd is the same
   binary (SHA-256 60597aa3...).
+- Bluetooth: no controller is modeled on UART3. For N90 iOS 6 builds, FirmwareKit now marks
+  `com.apple.BTServer.plist` disabled in the generated system volume. The supplied 10B329 log shows
+  BlueTool running immediately before an `AppleOnboardSerial` receive-queue assertion; Bluetooth is
+  therefore unavailable in newly generated iOS 6 bundles. Existing bundles need to be rebuilt to apply it.
 - Power-off: N81's knob (SpringBoard is portrait-only). The halt comes 18-40 s after the request, so the
   board's watch is 60 s (`pwroff_watch_ms`).
 - Sound: the ring/silent switch rests at ring. GPIO inputs idle high, and on this board high is silent, so until

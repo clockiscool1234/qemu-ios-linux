@@ -1069,6 +1069,51 @@ def with_mounted(volume, mnt, fn, rw=True):
         subprocess.run(["umount", mnt], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def disable_btserver(m):
+    roots = [
+        os.path.join(m, "System/Library/LaunchDaemons"),
+        os.path.join(m, "System/Library/LaunchAgents"),
+        os.path.join(m, "Library/LaunchDaemons"),
+        os.path.join(m, "Library/LaunchAgents"),
+    ]
+    matches = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".plist"):
+                continue
+            path = os.path.join(root, name)
+            job = _load_plist(path)
+            if not isinstance(job, dict):
+                continue
+            label = str(job.get("Label", "")).casefold()
+            args = job.get("ProgramArguments", [])
+            if isinstance(args, str):
+                args = [args]
+            programs = [job.get("Program")] + (args if isinstance(args, list) else [])
+            executables = {os.path.basename(arg).casefold() for arg in programs if isinstance(arg, str)}
+            if ("btserver" in label or "bluetooth" in label or "btserver" in name.casefold()
+                    or "bluetooth" in name.casefold()
+                    or executables.intersection({"btserver", "bluetool", "bluetoothd", "blued"})):
+                matches.append((path, job))
+    if not matches:
+        searched = ", ".join(os.path.relpath(root, m) for root in roots)
+        raise FirmwareError("no BTServer/BlueTool launchd job found in %s" % searched)
+    changed = False
+    for path, job in matches:
+        if job.get("Disabled") is True:
+            continue
+        job["Disabled"] = True
+        _put(path, plistlib.dumps(job, fmt=plistlib.FMT_XML))
+        changed = True
+    return changed
+
+
+def should_disable_btserver(board, version):
+    return board == "n90ap" and version.startswith("6.")
+
+
 # ---------------------------------------------------------------------------------------------
 # Activation: the lockdownd patch (port of FirmwareKit's CActivation/activation.c)
 # ---------------------------------------------------------------------------------------------
@@ -2821,6 +2866,11 @@ def create_kboot(args, entry, ipsw, ri, out, work):
     print("extracting HFS+ volume from rootfs.dmg...")
     extract_rootfs(dec_dmg, system_img, work)
 
+    if should_disable_btserver(board, entry.get("version", "")):
+        print("disabling the unmodeled Bluetooth service for iPhone 4 iOS 6...")
+        changed = with_mounted(system_img, os.path.join(work, "mnt-bt"), disable_btserver)
+        print("  BTServer %s" % ("disabled" if changed else "already disabled"))
+
     # 4b. lockdownd activation (A4 boards, iOS 4.x/5.x): patch the signed lockdownd in the rootfs and
     #     re-sign it, like FirmwareKit's SystemEdits.activate.  Needs root + the Linux hfsplus module.
     ios_major = int((entry.get("version", "0").split(".")[0] or "0")) if entry.get("version", "0")[:1].isdigit() else 0
@@ -3725,6 +3775,31 @@ def selftest(_args):
         check("daemons: kept set, iPhone keeps BTServer, iPod drops it",
               removed_daemons(["com.apple.BTServer.plist", "com.apple.iapd.plist", "com.apple.SpringBoard.plist"], True) == ["com.apple.iapd.plist"]
               and removed_daemons(["com.apple.BTServer.plist"], False) == ["com.apple.BTServer.plist"])
+        bt_root = os.path.join(d, "bt-root")
+        bt_job_dir = os.path.join(bt_root, DAEMONS)
+        os.makedirs(bt_job_dir)
+        bt_job_path = os.path.join(bt_job_dir, "com.apple.bluetoothd.plist")
+        with open(bt_job_path, "wb") as f:
+            plistlib.dump({"Label": "com.apple.bluetoothd", "ProgramArguments": ["/usr/sbin/other-daemon"]}, f)
+        bt_executable_path = os.path.join(bt_job_dir, "com.apple.other.plist")
+        with open(bt_executable_path, "wb") as f:
+            plistlib.dump({"Label": "com.apple.other", "ProgramArguments": ["/usr/sbin/BTServer"]}, f)
+        check("iPhone 4 iOS 6 finds Bluetooth launchd jobs by label and executable",
+              disable_btserver(bt_root) and _load_plist(bt_job_path)["Disabled"] is True
+              and _load_plist(bt_executable_path)["Disabled"] is True)
+        check("BTServer disabling is idempotent", not disable_btserver(bt_root))
+        empty_bt_root = os.path.join(d, "bt-empty")
+        os.makedirs(os.path.join(empty_bt_root, "System/Library/LaunchDaemons"))
+        try:
+            disable_btserver(empty_bt_root)
+            missing_bt_job_error = False
+        except FirmwareError:
+            missing_bt_job_error = True
+        check("BTServer disabling fails clearly when no matching job exists", missing_bt_job_error)
+        check("BTServer policy is limited to iPhone 4 iOS 6",
+              should_disable_btserver("n90ap", "6.1.3")
+              and not should_disable_btserver("n81ap", "6.1.3")
+              and not should_disable_btserver("n90ap", "7.1.2"))
 
         # vfdecrypt
         key36 = bytes(range(36))
