@@ -1599,6 +1599,18 @@ class CreateDeviceDialog(tk.Toplevel):
         self._jb_hint.grid(row=row, column=1, columnspan=2, **P)
         row += 1
 
+        # Skip activation
+        self._skip_act = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            f, text="Skip activation (leave lockdownd unpatched)",
+            variable=self._skip_act).grid(row=row, column=1, columnspan=2, **P)
+        row += 1
+        ttk.Label(f, text="Leaves lockdownd unpatched, so the device is not short-circuited to "
+                          "Activated (firmwarekit --skip-activation).",
+                  foreground="gray", wraplength=420, justify="left").grid(
+            row=row, column=1, columnspan=2, **P)
+        row += 1
+
         # Guest package + No GLES
         ttk.Label(f, text="Guest package:").grid(row=row, column=0, **P)
         self._gp_var = tk.StringVar()
@@ -1957,6 +1969,7 @@ class CreateDeviceDialog(tk.Toplevel):
         self._jb_requested = bool(self._jailbreak.get())    # read here: Tk vars belong to this thread
         self._no_gles_requested = bool(self._no_gles.get())
         self._gp_requested = self._gp_var.get().strip()
+        self._skip_act_requested = bool(self._skip_act.get())
 
         if self._ipsw_mode.get() == "browse":
             ipsw = self._ipsw_var.get().strip()
@@ -2120,11 +2133,12 @@ class CreateDeviceDialog(tk.Toplevel):
         jailbreak = bool(getattr(self, "_jb_requested", False))
         if jailbreak:
             cmd += ["--jailbreak"]
-        if dev.get("needs_sudo") or jailbreak or (gp and board != "n72ap"):      # the jailbreak edits the loop-mounted rootfs
-            if not shutil.which("pkexec"):
-                self._fail("This device needs root and pkexec (polkit) is not installed.")
-                return
-            cmd = self._as_root(cmd)
+        if getattr(self, "_skip_act_requested", False):
+            cmd += ["--skip-activation"]
+        if not shutil.which("pkexec"):      # always as root: the lockdownd patch edits the loop-mounted rootfs
+            self._fail("Creating a device needs root and pkexec (polkit) is not installed.")
+            return
+        cmd = self._as_root(cmd)
 
         try:
             Path(out).parent.mkdir(parents=True, exist_ok=True)
@@ -3059,7 +3073,7 @@ class App(tk.Tk):
                     *dev.get("screen", ("?", "?")), dev.get("ram_mb", "?")),
                 "SoC          {}".format(dev.get("soc", "?")),
                 "QEMU -M      {}".format(dev.get("qemu_machine", "?")),
-                "Needs root   {}".format("Yes" if dev.get("needs_sudo") else "No"),
+                "Needs root   Yes",
                 "Bootrom      {}".format(
                     ("Bundled (" + next(iter(sorted(d["path"].glob("bootrom_*")))).name + ")")
                     if dev.get("needs_bootrom") and any(d["path"].glob("bootrom_*"))

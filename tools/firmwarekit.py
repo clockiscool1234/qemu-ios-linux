@@ -2021,12 +2021,17 @@ def jb_members(package):
     return out
 
 
+def jb_skip(what):
+    """Debugging aid: FWK_JB_SKIP=grow,afc2,cydia,substrate,httpatch leaves those parts of the jailbreak out."""
+    return what in os.environ.get("FWK_JB_SKIP", "").replace(" ", "").split(",")
+
+
 def jb_packages(directory, major):
     """The packages to extract for iOS `major`: the bootstrap, Substrate on 3.x-6.x, Cydia HTTPatch on 3.x."""
     names = [JB_FILES[0][0]]
-    if major in JB_SUBSTRATE_MAJORS:
+    if major in JB_SUBSTRATE_MAJORS and not jb_skip("substrate"):
         names.append(JB_FILES[1][0])
-    if major == JB_HTTPATCH_MAJOR:
+    if major == JB_HTTPATCH_MAJOR and not jb_skip("httpatch"):
         names.append(JB_FILES[2][0])
     return [os.path.join(directory, n) for n in names]
 
@@ -2219,10 +2224,12 @@ def jailbreak_volume(m, directory, image=None, log=print):
     if major < 2:
         raise FirmwareError("the jailbreak needs iPhone OS 2.0 or later (this volume is %s)" % (ver or "unknown"))
     rep = {"ios": ver}
-    rep["afc2"] = jb_install_afc2(m, image, log)
-    log(rep["afc2"])
-    rep["cydia"] = jb_install_cydia(m, directory, major, log)
-    log(rep["cydia"])
+    if not jb_skip("afc2"):
+        rep["afc2"] = jb_install_afc2(m, image, log)
+        log(rep["afc2"])
+    if not jb_skip("cydia"):
+        rep["cydia"] = jb_install_cydia(m, directory, major, log)
+        log(rep["cydia"])
     return rep
 
 
@@ -2230,7 +2237,8 @@ def jailbreak_kboot_rootfs(system_img, system_mib, work, directory, log=print):
     """The jailbreak edits inside the extracted rootfs image of a kboot board: the volume grown to the partition
     size first (Cydia needs the room), then mounted and edited."""
     try:
-        hfs_grow(system_img, system_mib << 20)
+        if not jb_skip("grow"):
+            hfs_grow(system_img, system_mib << 20)
     except FirmwareError as e:
         if "already larger" not in str(e):
             raise
@@ -2855,6 +2863,13 @@ def create_kboot(args, entry, ipsw, ri, out, work):
     geo_name = "k48-16g-v1" if (board in ("n18ap", "n88ap") and entry.get("version", "").startswith("3.0")) else "k48-16g"
     geo = ipad1_nand.Geo(name=geo_name, **ipad1_nand.GEOMETRIES[geo_name])
     ipad1_nand.WHITENING = False if board in ("n18ap", "n88ap") else True
+    # 3.1.x's N88 driver (0xc03db8aa) rejects a store whose sig flags exceed 4
+    # ("Incompatible Signature"): the S5L8920 boards have no metadata-whitening
+    # anyway, so their store is formatted with flags 4 like their own FIL does.
+    # 4.x and 5.x accept flags 4 as well. The epoch stays the kernel's (nSig
+    # 0x43313133 on the N88, whose DeviceMap SCEP is 3).
+    if board in ("n18ap", "n88ap"):
+        ipad1_nand.SIG_FLAGS_OVERRIDE = 4
 
     recipe = entry.get("recipe", {})
     system_mib = int(recipe.get("system_mib", 1024))

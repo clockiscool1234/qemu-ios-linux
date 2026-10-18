@@ -646,11 +646,11 @@ def build(a):
     ftl = FTLWriter(st, geo)
     # LPN == 4 KiB LBA. Segments in ascending LBA order:
     segs = [(0, min(p1[1], len(head) // ps), lambda n: bytes(head[n * ps:(n + 1) * ps]))]
-    segs.append((p1[1], system.pages, system.get))
+    segs.append((p1[1], system.written() or system.pages, system.get))   # sparse holes (a grown, never-written tail) need no pages
     if a.s3 and p3[2]:
         s3 = FilePages(a.s3, ps)
         segs.append((p3[1], min(p3[2], s3.pages), s3.get))
-    segs = [(lba, range(count), get) for lba, count, get in segs]
+    segs = [(lba, range(count) if isinstance(count, int) else count, get) for lba, count, get in segs]
     if data:
         written = data.written()
         print("      data partition: %d pages, %d written (the rest are holes)" % (data.pages, len(written)))
